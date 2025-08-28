@@ -9,12 +9,171 @@ from rclpy.node import Node
 from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
 from ros2_camera_lidar_fusion.common import utils
 
-PIX_EPS   = 8        # px radius for auto-pick
-SHORTLIST_K = 8      # how many nearest candidates to show
-WIN_NAME = "correspondences"
-FONT = cv2.FONT_HERSHEY_SIMPLEX
+PIX_EPS = 10
+IMG_WIN = "image_correspondences"
 
-       
+# ---------- Open3D GUI wrapper ----------
+class PCDGui:
+    def __init__(self, title="pcd_correspondences", width=1200, height=800):
+        gui = o3d.visualization.gui
+        rendering = o3d.visualization.rendering
+
+        self.app = gui.Application.instance
+        self.app.initialize()
+        self.window = self.app.create_window(title, width, height)
+        self.scene = gui.SceneWidget()
+        self.scene.scene = rendering.Open3DScene(self.window.renderer)
+        self.window.add_child(self.scene)
+
+        self.material = rendering.MaterialRecord()
+        self.material.shader = "defaultLit"
+        self.material.point_size = 2.0
+
+        self._click_queue = []     # (x, y) pixels in widget coords
+        self._key_queue = []       # 'u','s','q'
+        self._markers = []         # [(name_sphere, label_handle|None)]
+        self._pcd_name = "pcd"
+
+        # # --- compat shim for return values ---
+        try:
+            ECR = gui.EventCallbackResult
+            self._RET_HANDLED = ECR.HANDLED
+            self._RET_IGNORED = ECR.IGNORED
+        except AttributeError:
+            # Fallback for builds without EventCallbackResult
+            self._RET_HANDLED = True
+            self._RET_IGNORED = False
+
+        # Mouse → collect LMB clicks
+        def on_mouse(e):
+            if (e.type == gui.MouseEvent.Type.BUTTON_DOWN and
+                e.is_button_down(gui.MouseButton.LEFT)):
+                self._click_queue.append((int(e.x), int(e.y)))
+                return self._RET_HANDLED
+            return self._RET_IGNORED
+
+        # Keys → mirror image window controls
+        def on_key(e):
+            if e.type == gui.KeyEvent.Type.DOWN:
+                ch = chr(e.key).lower() if 0 <= e.key < 256 else ""
+                if ch in ("u", "s", "q"):
+                    self._key_queue.append(ch)
+                    return self._RET_HANDLED
+            return self._RET_IGNORED
+
+        # register callbacks
+        self.scene.set_on_mouse(on_mouse)
+        self.window.set_on_key(on_key)
+
+        # keep the SceneWidget filling the window
+        def on_layout(ctx):
+            r = self.window.content_rect
+            self.scene.frame = r
+        self.window.set_on_layout(on_layout)
+
+    def clear(self):
+        # remove old markers
+        for name, lbl in self._markers:
+            try:
+                self.scene.scene.remove_geometry(name)
+            except Exception:
+                pass
+            try:
+                if lbl is not None:
+                    self.scene.remove_3d_label(lbl)
+            except Exception:
+                pass
+        self._markers.clear()
+
+    def set_pointcloud(self, pcd: o3d.geometry.PointCloud):
+        self.clear()
+        try:
+            self.scene.scene.remove_geometry(self._pcd_name)
+        except Exception:
+            pass
+        self.scene.scene.add_geometry(self._pcd_name, pcd, self.material)
+        bounds = pcd.get_axis_aligned_bounding_box()
+        self.scene.setup_camera(60.0, bounds, bounds.get_center())
+        self.scene.scene.show_axes(False)
+
+    def poll(self):
+        self.app.run_one_tick()
+
+    def pop_click(self):
+        return self._click_queue.pop(0) if self._click_queue else None
+
+    def pop_key(self):
+        return self._key_queue.pop(0) if self._key_queue else None
+
+    def add_marker(self, position: np.ndarray, idx: int):
+        # small red sphere + 3D label with index
+        sph = o3d.geometry.TriangleMesh.create_sphere(0.03)
+        sph.compute_vertex_normals()
+        sph.paint_uniform_color([1.0, 0.0, 0.0])
+        sph.translate(position.astype(float))
+
+        name = f"marker_{idx}"
+        self.scene.scene.add_geometry(name, sph, self.material)
+        lbl = None
+        try:
+            lbl = self.scene.add_3d_label(position.astype(float), str(idx))
+        except Exception:
+            pass
+        self._markers.append((name, lbl))
+
+    def undo_marker(self):
+        if not self._markers:
+            return
+        name, lbl = self._markers.pop()
+        try:
+            self.scene.scene.remove_geometry(name)
+        except Exception:
+            pass
+        try:
+            if lbl is not None:
+                self.scene.remove_3d_label(lbl)
+        except Exception:
+            pass
+
+    # project all 3D points to widget pixel coords; return nearest index
+    def pick_point_index(self, points_xyz: np.ndarray, click_xy: tuple[int, int], max_px_dist=12):
+        cam = self.scene.scene.camera
+        view = np.asarray(cam.get_view_matrix())          # 4x4
+        proj = np.asarray(cam.get_projection_matrix())    # 4x4
+
+        # world -> clip -> NDC -> screen
+        N = points_xyz.shape[0]
+        xyz1 = np.c_[points_xyz, np.ones((N, 1))]
+        clip = (xyz1 @ view.T) @ proj.T
+        w = clip[:, 3:4]
+        valid = w[:, 0] > 1e-9
+        clip = clip[valid]
+        w = w[valid]
+        if clip.size == 0:
+            return None
+        ndc = clip[:, :3] / w
+        # visible (inside clip volume)
+        vis = (np.abs(ndc[:, 0]) <= 1) & (np.abs(ndc[:, 1]) <= 1) & (ndc[:, 2] >= -1) & (ndc[:, 2] <= 1)
+        if not np.any(vis):
+            return None
+        ndc = ndc[vis]
+
+        # widget viewport
+        r = self.scene.frame  # Rect(x, y, w, h)
+        px = (ndc[:, 0] * 0.5 + 0.5) * r.width + r.x
+        py = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * r.height + r.y
+
+        # nearest in screen pixels
+        sx, sy = click_xy
+        d2 = (px - sx) ** 2 + (py - sy) ** 2
+        j = int(np.argmin(d2))
+        if d2[j] <= (max_px_dist ** 2):
+            # map back to original index
+            idx_map = np.flatnonzero(valid)[vis]
+            return int(idx_map[j])
+        return None
+
+
 class CorrespondenceTool(Node):
     def __init__(self):
         super().__init__('correspondence_tool')
@@ -26,72 +185,32 @@ class CorrespondenceTool(Node):
                                      cfg['general']['camera_intrinsic_calibration'])
         self.K, self.D, (self.W, self.H) = utils.load_intrinsics(intr_yaml)
 
-        guess_yaml = os.path.join(cfg['general']['config_folder'],
-                                  cfg['general']['camera_extrinsic_calibration'])
-        self.T_guess = None
-        if os.path.isfile(guess_yaml):
-            try:
-                self.T_guess = utils.load_extrinsic(guess_yaml)
-                self.get_logger().info("Using existing extrinsic as guess for assisted 3D picking.")
-            except Exception as e:
-                self.get_logger().warn(f"Failed to load extrinsic guess: {e}")
-
         self.pairs = self._scan_pairs(self.data_dir)
         if not self.pairs:
             self.get_logger().error(f"No .png/.pcd pairs found in '{self.data_dir}'")
             return
 
-        # State for mouse callback
-        self.click_queue = []          # list of (x,y) clicks
-        self.current_img = None
-        self.current_pcd = None
-        self.uv_guess    = None        # Nx2 projected points from guess
-        self.xyz_all     = None        # Nx3 original cloud points
+        # windows
+        cv2.namedWindow(IMG_WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(IMG_WIN, 1280, 720)
+        cv2.setMouseCallback(IMG_WIN, self._on_mouse_image)
 
-        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WIN_NAME, 1280, 720)
-        cv2.setMouseCallback(WIN_NAME, self._on_mouse)
+        self.o3d = PCDGui()
+
+        # state
+        self._img_clicks = []
+        self._pcd_points = []
+        self._img_overlay = None
+        self._img_base = None
+        self._pcd = None
+        self._pcd_xyz = None
+
+        self._go_next = False
+        self._quit = False
 
         self.run()
 
-
-    def _select_from_shortlist(self, base_img, click_uv):
-        """
-        Show top-K nearest projected points around click_uv on the image.
-        User chooses with keys '1'..'K'. 'm' = open Open3D instead, 'c' = cancel.
-        Returns 3D point (np.float32, shape(3,)) or None or the string 'open3d'.
-        """
-        if self.uv_guess is None or self.xyz_all is None:
-            return 'open3d'  # no guess: fall back to Open3D
-
-        uv = self.uv_guess
-        d2 = np.sum((uv - np.float32(click_uv))[None, :]**2, axis=2).ravel() if uv.ndim==3 else np.sum((uv - np.float32(click_uv))**2, axis=1)
-        order = np.argsort(d2)[:min(SHORTLIST_K, len(d2))]
-        if order.size == 0:
-            return 'open3d'
-
-        vis = base_img.copy()
-        for i, idx in enumerate(order, start=1):
-            u, v = uv[idx]
-            cv2.circle(vis, (int(u), int(v)), 6, (0, 255, 255), 2)
-            cv2.putText(vis, str(i), (int(u)+8, int(v)-8), FONT, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(vis, str(i), (int(u)+8, int(v)-8), FONT, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
-
-        cv2.putText(vis, "Pick 1..{}  |  m=Open3D  c=cancel".format(len(order)), (12, 32),
-                    FONT, 0.7, (40, 230, 40), 2, cv2.LINE_AA)
-
-        while True:
-            cv2.imshow(WIN_NAME, vis)
-            k = cv2.waitKey(0) & 0xFF
-            if k in [ord(str(x)) for x in range(1, len(order)+1)]:
-                sel = int(chr(k)) - 1
-                return self.xyz_all[order[sel]].astype(np.float32)
-            if k == ord('m'):
-                return 'open3d'
-            if k == ord('c') or k == 27:
-                return None
-
-    # ---------- IO helpers ----------
+    # ---------- IO ----------
     def _scan_pairs(self, d):
         files = os.listdir(d); m = {}
         for f in files:
@@ -104,122 +223,126 @@ class CorrespondenceTool(Node):
                 pairs.append((k, v['png'], v['pcd']))
         return pairs
 
-    # ---------- Mouse ----------
-    def _on_mouse(self, event, x, y, flags, param=None):
+    # ---------- image picking ----------
+    def _on_mouse_image(self, event, x, y, flags, param=None):
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.click_queue.append((int(x), int(y)))
+            self._img_clicks.append((int(x), int(y)))
 
-    # ---------- Assisted picking ----------
-    def _prepare_guess_projection(self, pcd):
-        if self.T_guess is None: 
-            self.uv_guess = None; self.xyz_all = None; return
-        xyz = np.asarray(pcd.points, dtype=np.float32)
-        if xyz.shape[0] == 0:
-            self.uv_guess = None; self.xyz_all = None; return
-        pc = utils.transform_points(self.T_guess, xyz)
-        uv = utils.project_points(pc, self.K, self.D)
-        self.uv_guess = uv.astype(np.float32)
-        self.xyz_all  = xyz
+    def _draw_image_overlay(self):
+        show = self._img_base.copy()
+        # header
+        msg = "LMB=add, u=undo, s=save-next, q=quit"
+        cv2.putText(show, msg, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 230, 40), 2, cv2.LINE_AA)
 
-    def _autopick_3d(self, click_uv):
-        if self.uv_guess is None or self.xyz_all is None:
-            return None
-        cu = np.array(click_uv, dtype=np.float32)
-        d2 = np.sum((self.uv_guess - cu[None, :])**2, axis=1)
-        idx = np.argmin(d2)
-        if np.sqrt(d2[idx]) <= PIX_EPS:
-            return self.xyz_all[idx].astype(np.float32)
-        return None
+        # points with numbers (red dot + black number centered)
+        for i, (u, v) in enumerate(self._img_overlay_points, start=1):
+            cv2.circle(show, (int(u), int(v)), 7, (0, 0, 255), -1)
+            txt = str(i)
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cx, cy = int(u) - tw // 2, int(v) + th // 2 - 2
+            cv2.putText(show, txt, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+        return show
 
-    def _manual_pick_3d(self, pcd):
-        vis = o3d.visualization.VisualizerWithEditing()
-        vis.create_window(window_name="Pick one 3D point (Shift+LMB to add, Q to close)", width=1200, height=800)
-        vis.add_geometry(pcd)
-
-        # a smaller point size helps the giant sphere look less overwhelming
-        ro = vis.get_render_option()
-        ro.point_size = 3
-
-        vis.run()
-        inds = vis.get_picked_points()
-        vis.destroy_window()
-
-        # IMPORTANT: re-register OpenCV window + callback after Open3D
-        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WIN_NAME, 1280, 720)
-        cv2.setMouseCallback(WIN_NAME, self._on_mouse)
-
-        if not inds:
-            return None
-        p = np.asarray(pcd.points)[inds[0]].astype(np.float32)
-        return p
-
-    # ---------- Main loop ----------
+    # ---------- main ----------
     def run(self):
         for name, img_path, pcd_path in self.pairs:
+            if self._quit:
+                break
+
             img = cv2.imread(img_path)
             pcd = o3d.io.read_point_cloud(pcd_path)
             if img is None or pcd.is_empty():
                 self.get_logger().warn(f"Skip {name} (bad image/pcd).")
                 continue
 
-            self.current_img = img
-            self.current_pcd = pcd
-            self._prepare_guess_projection(pcd)
+            self._img_base = img
+            self._img_overlay_points = []
+            self._img_clicks.clear()
 
-            uv_list = []
-            xyz_list = []
+            self._pcd = pcd
+            self._pcd_points = []
+            self.o3d.set_pointcloud(pcd)
+            self._pcd_xyz = np.asarray(pcd.points)
 
-            overlay = img.copy()
-            msg = f"{name} | click=add, u=undo, s=save, q=quit"
-            cv2.putText(overlay, msg, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (40, 230, 40), 1, cv2.LINE_AA)
+            cv2.setWindowTitle(IMG_WIN, f"Image: {name}")
 
-            while True:
-                show = overlay.copy()
-                for (u, v) in uv_list:
-                    cv2.circle(show, (int(u), int(v)), 4, (0, 0, 255), -1)
+            self._go_next = False
+            while not self._go_next and not self._quit:
+                # process Open3D events
+                self.o3d.poll()
 
-                cv2.imshow(WIN_NAME, show)
+                # handle O3D mouse picks
+                c = self.o3d.pop_click()
+                if c is not None:
+                    idx = self.o3d.pick_point_index(self._pcd_xyz, c, max_px_dist=PIX_EPS)
+                    if idx is not None:
+                        pt = self._pcd_xyz[idx]
+                        self._pcd_points.append(pt.tolist())
+                        self.o3d.add_marker(pt, len(self._pcd_points))
+
+                # image pending clicks
+                while self._img_clicks:
+                    u, v = self._img_clicks.pop(0)
+                    self._img_overlay_points.append((float(u), float(v)))
+
+                # draw image overlay
+                show = self._draw_image_overlay()
+                cv2.imshow(IMG_WIN, show)
+
+                # keys from OpenCV
                 k = cv2.waitKey(10) & 0xFF
+                if k:
+                    self._handle_key(chr(k).lower())
 
-                # handle pending clicks
-                while self.click_queue:
-                    (ux, vy) = self.click_queue.pop(0)
+                # keys from Open3D
+                ok = self.o3d.pop_key()
+                if ok:
+                    self._handle_key(ok)
 
-                    # 1) try strict autopick
-                    p3 = self._autopick_3d((ux, vy))
-                    if p3 is None:
-                        # 2) shortlist UI on the image if guess exists
-                        choice = self._select_from_shortlist(self.current_img, (ux, vy))
-                        if isinstance(choice, str) and choice == 'open3d':
-                            # 3) real manual pick in 3D
-                            p3 = self._manual_pick_3d(self.current_pcd)
-                        else:
-                            p3 = choice
+                # enforce paired operations visibility (optional)
+                # (we let you select freely; we validate on save)
 
-                    if p3 is None:
-                        # user cancelled; continue without adding a pair
-                        continue
+            # save/next if requested
+            if self._quit:
+                break
 
-                    uv_list.append((float(ux), float(vy)))
-                    xyz_list.append((float(p3[0]), float(p3[1]), float(p3[2])))
+            number_p_img = len(self._img_overlay_points)
+            number_p_pcd = len(self._pcd_points)
+            min_number_p = min(number_p_img, number_p_pcd)
+            if number_p_img == 0 and number_p_pcd == 0:
+                self.get_logger().info(f"No points for {name}")
+                continue
+            
+            if number_p_img != number_p_pcd:
+                self.get_logger().warn(
+                    f"Counts mismatch for {name}: image={number_p_img} vs pcd={number_p_pcd}; Taken first {min_number_p} points."
+                )
 
+            utils.write_corresp_append(self.out_txt, name, self._img_overlay_points[:min_number_p], self._pcd_points[:min_number_p])
+            self.get_logger().info(f"Saved {min_number_p} pairs for {name} → {self.out_txt}")
 
-                if k == ord('u') and uv_list:
-                    uv_list.pop(); xyz_list.pop()
-                elif k == ord('s'):
-                    if len(uv_list) > 0:
-                        utils.write_corresp_append(self.out_txt, name, uv_list, xyz_list)
-                        self.get_logger().info(f"Saved {len(uv_list)} pairs for {name} → {self.out_txt}")
-                    else:
-                        self.get_logger().info(f"Find {len(uv_list)} pairs for {name}")
+        cv2.destroyWindow(IMG_WIN)
 
-                    break
-                elif k == ord('q'):
-                    cv2.destroyWindow(WIN_NAME)
-                    return
+    def _handle_key(self, ch: str):
+        if ch == 'u':
+            # undo last pair atomically if both have elements; else undo whichever has
+            did = False
+            if self._img_overlay_points:
+                self._img_overlay_points.pop()
+                did = True
+            if self._pcd_points:
+                self._pcd_points.pop()
+                self.o3d.undo_marker()
+                did = True
+            if not did:
+                return
+        elif ch == 's':
+            # move to next pair (save happens after loop with validation)
+            self._go_next = True
+        elif ch == 'q':
+            self._quit = True
+        # else ignore
 
-        cv2.destroyWindow(WIN_NAME)
 
 def main(args=None):
     rclpy.init(args=args)

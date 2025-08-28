@@ -14,9 +14,9 @@ densify_parameters:
   #    grid_step_px ↓ (e.g., 2) → denser image-plane sampling; ↑ → sparser.
   #    fill_iters 3–6 usually enough; more is slower.
   #    voxel_size_m 0.05–0.10 for outdoors, 0.02–0.05 for indoors.""""
-  grid_step_px: 4          # uniform spacing on image plane
-  fill_iters: 12           # hole-fill iterations
-  voxel_size_m: 0.01       # voxel size in LiDAR frame (m)
+  grid_step_px: 3          # uniform spacing on image plane
+  fill_iters: 16           # hole-fill iterations
+  voxel_size_m: 0.015       # voxel size in LiDAR frame (m)
   max_interp_dist: 0.2     # do not interpolate points with hier distance (m)
 
 general:
