@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import cv2
+import time
 import numpy as np
 import open3d as o3d
 import rclpy
@@ -34,32 +35,38 @@ class PCDGui:
         self._markers = []         # [(name_sphere, label_handle|None)]
         self._pcd_name = "pcd"
 
+        self._last_down_t = 0.0
+        self._dbl_thr_s = 0.35
+
         # # --- compat shim for return values ---
         try:
             ECR = gui.EventCallbackResult
-            self._RET_HANDLED = ECR.HANDLED
-            self._RET_IGNORED = ECR.IGNORED
-        except AttributeError:
-            # Fallback for builds without EventCallbackResult
-            self._RET_HANDLED = True
-            self._RET_IGNORED = False
+            RET_CONSUMED, RET_HANDLED, RET_IGNORED = ECR.CONSUMED, ECR.HANDLED, ECR.IGNORED
+        except AttributeError:  # older wheels
+            RET_CONSUMED, RET_HANDLED, RET_IGNORED = 2, 1, 0
 
         # Mouse → collect LMB clicks
         def on_mouse(e):
             if (e.type == gui.MouseEvent.Type.BUTTON_DOWN and
                 e.is_button_down(gui.MouseButton.LEFT)):
+        
+                now = time.monotonic()
+                if (now - self._last_down_t) < self._dbl_thr_s:
+                    self._last_down_t = now
+                    return RET_CONSUMED
+
                 self._click_queue.append((int(e.x), int(e.y)))
-                return self._RET_HANDLED
-            return self._RET_IGNORED
+                self._last_down_t = now
+                return RET_HANDLED
+            return RET_IGNORED
 
         # Keys → mirror image window controls
         def on_key(e):
             if e.type == gui.KeyEvent.Type.DOWN:
                 ch = chr(e.key).lower() if 0 <= e.key < 256 else ""
-                if ch in ("u", "s", "q"):
-                    self._key_queue.append(ch)
-                    return self._RET_HANDLED
-            return self._RET_IGNORED
+                self._key_queue.append(ch)
+                return RET_HANDLED
+            return RET_IGNORED
 
         # register callbacks
         self.scene.set_on_mouse(on_mouse)
@@ -245,26 +252,33 @@ class CorrespondenceTool(Node):
 
     # ---------- main ----------
     def run(self):
-        for name, img_path, pcd_path in self.pairs:
-            if self._quit:
-                break
+        force_skip_mismatch = False
+        force_skip_zero = False
+        image_index = 0
+        while image_index < len(self.pairs):
+            if not force_skip_mismatch and not force_skip_zero:
+                name, img_path, pcd_path = self.pairs[image_index]
+                image_index += 1
 
-            img = cv2.imread(img_path)
-            pcd = o3d.io.read_point_cloud(pcd_path)
-            if img is None or pcd.is_empty():
-                self.get_logger().warn(f"Skip {name} (bad image/pcd).")
-                continue
+                if self._quit:
+                    break
 
-            self._img_base = img
-            self._img_overlay_points = []
-            self._img_clicks.clear()
+                img = cv2.imread(img_path)
+                pcd = o3d.io.read_point_cloud(pcd_path)
+                if img is None or pcd.is_empty():
+                    self.get_logger().warn(f"Skip {name} (bad image/pcd).")
+                    continue
 
-            self._pcd = pcd
-            self._pcd_points = []
-            self.o3d.set_pointcloud(pcd)
-            self._pcd_xyz = np.asarray(pcd.points)
+                self._img_base = img
+                self._img_overlay_points = []
+                self._img_clicks.clear()
 
-            cv2.setWindowTitle(IMG_WIN, f"Image: {name}")
+                self._pcd = pcd
+                self._pcd_points = []
+                self.o3d.set_pointcloud(pcd)
+                self._pcd_xyz = np.asarray(pcd.points)
+
+                cv2.setWindowTitle(IMG_WIN, f"Image: {name}")
 
             self._go_next = False
             while not self._go_next and not self._quit:
@@ -308,34 +322,47 @@ class CorrespondenceTool(Node):
 
             number_p_img = len(self._img_overlay_points)
             number_p_pcd = len(self._pcd_points)
-            min_number_p = min(number_p_img, number_p_pcd)
             if number_p_img == 0 and number_p_pcd == 0:
-                self.get_logger().info(f"No points for {name}")
+                if not force_skip_zero:
+                    self.get_logger().info(f"No points for {name}; press 's' to force skip")
+                    force_skip_zero = True
+                else:
+                    self.get_logger().info(f"No points for {name}; force skip")
+                    force_skip_mismatch = False
+                    force_skip_zero = False
                 continue
             
             if number_p_img != number_p_pcd:
-                self.get_logger().warn(
-                    f"Counts mismatch for {name}: image={number_p_img} vs pcd={number_p_pcd}; Taken first {min_number_p} points."
-                )
+                if not force_skip_mismatch:
+                    self.get_logger().warn(
+                        f"Counts mismatch for {name}: image={number_p_img} vs pcd={number_p_pcd}; press 's' to force skip."
+                    )
+                    force_skip_mismatch = True
+                else:
+                    self.get_logger().warn(
+                        f"Counts mismatch for {name}: image={number_p_img} vs pcd={number_p_pcd}; force skip."
+                    )
+                    force_skip_mismatch = False
+                    force_skip_zero = False
+                continue
 
-            utils.write_corresp_append(self.out_txt, name, self._img_overlay_points[:min_number_p], self._pcd_points[:min_number_p])
-            self.get_logger().info(f"Saved {min_number_p} pairs for {name} → {self.out_txt}")
+            force_skip_mismatch = False
+            force_skip_zero = False
+            utils.write_corresp_append(self.out_txt, name, self._img_overlay_points, self._pcd_points)
+            self.get_logger().info(f"Saved {number_p_pcd} pairs for {name} → {self.out_txt}")
 
         cv2.destroyWindow(IMG_WIN)
 
     def _handle_key(self, ch: str):
         if ch == 'u':
-            # undo last pair atomically if both have elements; else undo whichever has
-            did = False
-            if self._img_overlay_points:
-                self._img_overlay_points.pop()
-                did = True
-            if self._pcd_points:
-                self._pcd_points.pop()
+            # undo last pair atomically if both have elements; else extra point
+            img_points, pcd_points = self._img_overlay_points, self._pcd_points
+            d = len(img_points) - len(pcd_points)  # >0: extra img, <0: extra pcd, 0: pop both if present
+            if img_points and d >= 0:
+                img_points.pop()
+            if pcd_points and d <= 0:
+                pcd_points.pop()
                 self.o3d.undo_marker()
-                did = True
-            if not did:
-                return
         elif ch == 's':
             # move to next pair (save happens after loop with validation)
             self._go_next = True
