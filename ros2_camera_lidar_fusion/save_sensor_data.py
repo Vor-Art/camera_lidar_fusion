@@ -29,21 +29,12 @@ class SaveData(Node):
         self.keyboard_listener_enabled = config_file['general']['keyboard_listener']
         self.slop = config_file['general']['slop']
 
-
         if not os.path.exists(self.storage_path):
             os.makedirs(self.storage_path)
         self.get_logger().warn(f'Data will be saved at {self.storage_path}')
 
-        self.image_sub = Subscriber(
-            self,
-            Image,
-            self.image_topic
-        )
-        self.pointcloud_sub = Subscriber(
-            self,
-            PointCloud2,
-            self.lidar_topic
-        )
+        self.image_sub = Subscriber(self, Image, self.image_topic)
+        self.pointcloud_sub = Subscriber(self, PointCloud2, self.lidar_topic)
 
         self.ts = ApproximateTimeSynchronizer(
             [self.image_sub, self.pointcloud_sub],
@@ -52,6 +43,14 @@ class SaveData(Node):
         )
         self.ts.registerCallback(self.synchronize_data)
 
+        # ---- Cached last synchronized pair + sync primitives ----
+        self._cache_lock = threading.Lock()
+        self._cached_image_msg = None
+        self._cached_pointcloud_msg = None
+        self._data_available = threading.Event()  # set when cache has a pair
+        self._save_request = threading.Event()    # set when user pressed Enter
+
+        # In auto mode (no keyboard), we save every synchronized pair.
         self.save_data_flag = not self.keyboard_listener_enabled
         if self.keyboard_listener_enabled:
             self.start_keyboard_listener()
@@ -62,25 +61,71 @@ class SaveData(Node):
             while True:
                 key = input("Press 'Enter' to save data (keyboard listener enabled): ")
                 if key.strip() == '':
-                    self.save_data_flag = True
-                    self.get_logger().info('Space key pressed, ready to save data')
+                    # Request save of last cached pair (if none yet, wait for it).
+                    self._save_request.set()
+                    saved_now = self._try_save_cached_pair()
+                    if not saved_now:
+                        self.get_logger().info("No cached pair yet — waiting for synchronized data...")
+                        self._data_available.wait()  # wait until synchronize_data caches a pair
+                        self._try_save_cached_pair()  # will save and reset cache
         thread = threading.Thread(target=listen_for_space, daemon=True)
         thread.start()
 
     def synchronize_data(self, image_msg, pointcloud_msg):
-        """Handles synchronized messages and saves data if the flag is set."""
-        if self.save_data_flag:
+        """Handles synchronized messages and saves data if configured."""
+        # Update cache with the latest synchronized pair.
+        with self._cache_lock:
+            self._cached_image_msg = image_msg
+            self._cached_pointcloud_msg = pointcloud_msg
+            self._data_available.set()
 
+        # If we are in auto-save mode, save every synchronized pair.
+        if not self.keyboard_listener_enabled and self.save_data_flag:
+            self._try_save_cached_pair()
+            return
+
+        # If user requested a save (pressed Enter earlier), fulfill it now.
+        if self.keyboard_listener_enabled and self._save_request.is_set():
+            self._try_save_cached_pair()
+
+    def _try_save_cached_pair(self) -> bool:
+        """Save the currently cached pair (if any) and reset the cache. Returns True if saved."""
+        with self._cache_lock:
+            image_msg = self._cached_image_msg
+            pointcloud_msg = self._cached_pointcloud_msg
+
+            if image_msg is None or pointcloud_msg is None:
+                return False
+
+            # Generate name and enforce storage limit.
             file_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            total_files = len(os.listdir(self.storage_path))/2
-            if total_files < self.max_file_saved:
-                self.get_logger().info(f'Synchronizing data at {file_name}')
+            try:
+                # Count pairs as .png/.pcd; keep user's simple heuristic (files/2).
+                total_files = len(os.listdir(self.storage_path)) / 2.0
+            except Exception as e:
+                self.get_logger().error(f'Failed to count files: {e}')
+                total_files = 0
+
+            if total_files >= self.max_file_saved:
+                self.get_logger().info(f'To many data total_files={total_files}')
+                # Do not clear save request so user can retry later if desired.
+                return False
+
+            self.get_logger().info(f'Saving cached synchronized data as {file_name}')
+            # Perform save under lock to keep pair consistent.
+            try:
                 self.save_data(image_msg, pointcloud_msg, file_name)
-            else:
-                self.get_logger().info(f'To many data {total_files=}')
-                
-            if self.keyboard_listener_enabled:
-                self.save_data_flag = False
+            except Exception as e:
+                self.get_logger().error(f'Failed to save data: {e}')
+                return False
+
+            # Reset cache after successful save so next Enter won't re-save the same pair.
+            self._cached_image_msg = None
+            self._cached_pointcloud_msg = None
+            self._data_available.clear()
+            self._save_request.clear()
+            return True
+
     def pointcloud2_to_open3d(self, pointcloud_msg):
         """Converts a PointCloud2 message to an Open3D point cloud."""
         points = []
@@ -109,7 +154,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
