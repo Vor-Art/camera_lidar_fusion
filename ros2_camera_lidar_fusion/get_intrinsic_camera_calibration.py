@@ -19,7 +19,7 @@ class CameraInfoSaver(Node):
             rclpy.shutdown()
             return
 
-        self.info_topic   = cfg['camera']['info_topic']
+        self.info_topic   = cfg['input']['info_topic']
         self.output_dir   = cfg['general']['config_folder']
         self.output_file  = cfg['general']['camera_intrinsic_calibration']
         os.makedirs(self.output_dir, exist_ok=True)
