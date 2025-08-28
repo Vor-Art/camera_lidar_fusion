@@ -9,7 +9,7 @@ from rclpy.node import Node
 
 from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
 from ros2_camera_lidar_fusion.common import utils
-
+from ros2_camera_lidar_fusion import get_extrinsic_camera_calibration as calib
 PIX_EPS = 10
 IMG_WIN = "image_correspondences"
 
@@ -26,14 +26,23 @@ class PCDGui:
         self.scene.scene = rendering.Open3DScene(self.window.renderer)
         self.window.add_child(self.scene)
 
-        self.material = rendering.MaterialRecord()
-        self.material.shader = "defaultLit"
-        self.material.point_size = 2.0
+        self._pt_size = 3.0        # default point size
+
+        # point cloud material (point size lives here)
+        self.pcd_mat = rendering.MaterialRecord()
+        self.pcd_mat.shader = "defaultUnlit"
+        self.pcd_mat.point_size = float(self._pt_size)
+
+        # marker material (solid color, independent of point size)
+        self.marker_mat = rendering.MaterialRecord()
+        self.marker_mat.shader = "unlitSolidColor"
+        self.marker_mat.base_color = (1.0, 0.0, 0.0, 1.0)
 
         self._click_queue = []     # (x, y) pixels in widget coords
         self._key_queue = []       # 'u','s','q'
         self._markers = []         # [(name_sphere, label_handle|None)]
         self._pcd_name = "pcd"
+        self.T_guess = None
 
         self._last_down_t = 0.0
         self._dbl_thr_s = 0.35
@@ -63,9 +72,11 @@ class PCDGui:
         # Keys → mirror image window controls
         def on_key(e):
             if e.type == gui.KeyEvent.Type.DOWN:
-                ch = chr(e.key).lower() if 0 <= e.key < 256 else ""
-                self._key_queue.append(ch)
-                return RET_HANDLED
+                # printable ASCII
+                if 0 <= e.key < 256:
+                    ch = chr(e.key).lower()
+                    self._key_queue.append(ch)
+                    return RET_HANDLED
             return RET_IGNORED
 
         # register callbacks
@@ -77,6 +88,14 @@ class PCDGui:
             r = self.window.content_rect
             self.scene.frame = r
         self.window.set_on_layout(on_layout)
+
+    def set_point_size(self, px: float):
+        self._pt_size = max(1.0, float(px))  # clamp if you want
+        self.pcd_mat.point_size = self._pt_size
+        try:
+            self.scene.scene.modify_geometry_material(self._pcd_name, self.pcd_mat)
+        except Exception:
+            pass
 
     def clear(self):
         # remove old markers
@@ -98,7 +117,7 @@ class PCDGui:
             self.scene.scene.remove_geometry(self._pcd_name)
         except Exception:
             pass
-        self.scene.scene.add_geometry(self._pcd_name, pcd, self.material)
+        self.scene.scene.add_geometry(self._pcd_name, pcd, self.pcd_mat)
         bounds = pcd.get_axis_aligned_bounding_box()
         self.scene.setup_camera(60.0, bounds, bounds.get_center())
         self.scene.scene.show_axes(False)
@@ -120,7 +139,7 @@ class PCDGui:
         sph.translate(position.astype(float))
 
         name = f"marker_{idx}"
-        self.scene.scene.add_geometry(name, sph, self.material)
+        self.scene.scene.add_geometry(name, sph, self.marker_mat)
         lbl = None
         try:
             lbl = self.scene.add_3d_label(position.astype(float), str(idx))
@@ -187,9 +206,10 @@ class CorrespondenceTool(Node):
 
         cfg = extract_configuration()
         self.data_dir = cfg['general']['data_folder']
+        self.config_dir = cfg['general']['config_folder']
         self.out_txt  = os.path.join(self.data_dir, cfg['general']['correspondence_file'])
-        intr_yaml     = os.path.join(cfg['general']['config_folder'],
-                                     cfg['general']['camera_intrinsic_calibration'])
+        intr_yaml     = os.path.join(self.config_dir,cfg['general']['camera_intrinsic_calibration'])
+        self.extr_yaml= os.path.join(self.data_dir,"prior_calibration_extrinsics.yaml")
         self.K, self.D, (self.W, self.H) = utils.load_intrinsics(intr_yaml)
 
         self.pairs = self._scan_pairs(self.data_dir)
@@ -238,7 +258,7 @@ class CorrespondenceTool(Node):
     def _draw_image_overlay(self):
         show = self._img_base.copy()
         # header
-        msg = "LMB=add, u=undo, s=save-next, q=quit"
+        msg = "LMB=add, u=undo, s=save-next, f=calculate, q=quit"
         cv2.putText(show, msg, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 230, 40), 2, cv2.LINE_AA)
 
         # points with numbers (red dot + black number centered)
@@ -250,10 +270,23 @@ class CorrespondenceTool(Node):
             cv2.putText(show, txt, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
         return show
 
+    def _update_prior_guess(self):
+        calib.calibrate_extrinsics(extr_file=self.extr_yaml)
+        if os.path.isfile(self.extr_yaml):
+            try:
+                self.T_guess = utils.load_extrinsic(self.extr_yaml)
+                self.get_logger().info("Using existing extrinsic as guess for assisted 3D picking.")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to load extrinsic guess: {e}")
+
     # ---------- main ----------
     def run(self):
         force_skip_mismatch = False
         force_skip_zero = False
+
+        # # reset file
+        # open(self.out_txt, 'w').close()
+
         image_index = 0
         while image_index < len(self.pairs):
             if not force_skip_mismatch and not force_skip_zero:
@@ -351,6 +384,7 @@ class CorrespondenceTool(Node):
             utils.write_corresp_append(self.out_txt, name, self._img_overlay_points, self._pcd_points)
             self.get_logger().info(f"Saved {number_p_pcd} pairs for {name} → {self.out_txt}")
 
+        calib.calibrate_extrinsics(extr_file=self.extr_yaml)
         cv2.destroyWindow(IMG_WIN)
 
     def _handle_key(self, ch: str):
@@ -366,8 +400,14 @@ class CorrespondenceTool(Node):
         elif ch == 's':
             # move to next pair (save happens after loop with validation)
             self._go_next = True
+        elif ch == 'f':
+            self._update_prior_guess()
         elif ch == 'q':
             self._quit = True
+        elif ch in ('[', '-'):
+            self.o3d.set_point_size(self.o3d._pt_size - 1)
+        elif ch in (']', '+', '='):
+            self.o3d.set_point_size(self.o3d._pt_size + 1)
         # else ignore
 
 
