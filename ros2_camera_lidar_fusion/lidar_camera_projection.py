@@ -15,7 +15,7 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 import sensor_msgs_py.point_cloud2 as pc2
 from std_msgs.msg import Header
 
-from ros2_camera_lidar_fusion.read_yaml import extract_configuration
+from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
 
 
 # ----------------- Loaders -----------------

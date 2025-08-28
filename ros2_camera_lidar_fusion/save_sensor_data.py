@@ -10,7 +10,7 @@ from sensor_msgs_py import point_cloud2
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 import threading
 
-from ros2_camera_lidar_fusion.read_yaml import extract_configuration
+from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
 
 class SaveData(Node):
     def __init__(self):

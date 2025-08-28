@@ -9,7 +9,7 @@ import yaml
 import numpy as np
 from datetime import datetime
 
-from ros2_camera_lidar_fusion.read_yaml import extract_configuration
+from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
 
 class CameraCalibrationNode(Node):
     def __init__(self):
