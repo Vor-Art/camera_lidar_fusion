@@ -125,6 +125,7 @@ class LidarCameraProjectionNode(Node):
         self.grid_step_px   = int(dp['grid_step_px'])   # uniform spacing on image plane
         self.fill_iters     = int(dp['fill_iters'])     # hole-fill iterations
         self.voxel_size_m   = float(dp['voxel_size_m']) # voxel size in LiDAR frame (m)
+        self.max_interp_dist   = float(dp['max_interp_dist']) # distance to interpolate (m)
 
         self.get_logger().info(f"Loaded extrinsic:\n{self.T_lidar_to_cam}")
 
@@ -189,7 +190,7 @@ class LidarCameraProjectionNode(Node):
         self.pub_image.publish(out_img)
 
         # densify in image plane (z-buffer splat), backproject, color, publish
-        xyz_dense, px_dense = self.densify_depth_uniform(u, v, xyz_cam[:, 2], cv_image)
+        xyz_dense, px_dense = self.densify_depth_uniform(u, v, xyz_cam[:, 2], cv_image, self.max_interp_dist)
         
         # transform densified points from cam → lidar
         xyz_dense_lidar = transform_points(xyz_dense, self.T_cam_to_lidar)
@@ -219,29 +220,42 @@ class LidarCameraProjectionNode(Node):
         cloud_msg = pc2.create_cloud(header, fields, pts.tolist())
         self.pub_cloud.publish(cloud_msg)
 
-    def densify_depth_uniform(self, u, v, z, img):
+    def densify_depth_uniform(self, u, v, z, img, max_interp_dist=0.2):
         h, w = img.shape[:2]
         fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
         cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
 
-        # z-buffer at pixel centers (vectorized, no Python loops)
+        # --- z-buffer at pixel centers (fast) ---
         depth = np.full((h * w,), np.inf, np.float32)
         idx = (v.astype(np.int64) * w + u.astype(np.int64))
         np.minimum.at(depth, idx, z.astype(np.float32))
         depth = depth.reshape(h, w)
 
-        # iterative neighbor-averaging hole fill (fast)
-        valid = np.isfinite(depth).astype(np.float32)
+        # --- iterative neighbor-averaging hole fill ---
         for _ in range(max(1, self.fill_iters)):
-            num = cv2.blur(np.where(np.isfinite(depth), depth, 0.0), ksize=(3, 3), borderType=cv2.BORDER_REPLICATE)
-            den = cv2.blur(valid, ksize=(3, 3), borderType=cv2.BORDER_REPLICATE)
-            fill_mask = (np.isfinite(depth) == False) & (den > 0)
+            valid = np.isfinite(depth)
+            num = cv2.blur(np.where(valid, depth, 0.0), (3, 3), borderType=cv2.BORDER_REPLICATE)
+            den = cv2.blur(valid.astype(np.float32), (3, 3), borderType=cv2.BORDER_REPLICATE)
+
+            # candidate fill positions
+            fill_mask = ~valid & (den > 0)
             if not np.any(fill_mask):
                 break
-            depth[fill_mask] = (num[fill_mask] / den[fill_mask]).astype(np.float32)
-            valid[fill_mask] = 1.0
 
-        # uniform sampling on a grid
+            # average depth from neighbors
+            avg_depth = num / np.maximum(den, 1e-6)
+
+            # distance check: only fill if neighbors are close in depth
+            # compute local min/max depth in 3x3 window
+            min_d = cv2.erode(np.where(valid, depth, np.inf), np.ones((3, 3), np.uint8))
+            max_d = cv2.dilate(np.where(valid, depth, -np.inf), np.ones((3, 3), np.uint8))
+            ok = (max_d - min_d) < max_interp_dist
+
+            # only accept pixels where disparity is small
+            final_mask = fill_mask & ok
+            depth[final_mask] = avg_depth[final_mask]
+
+        # --- uniform sampling on a grid ---
         xs = np.arange(0, w, max(1, self.grid_step_px), dtype=np.int32)
         ys = np.arange(0, h, max(1, self.grid_step_px), dtype=np.int32)
         gx, gy = np.meshgrid(xs, ys)
@@ -261,6 +275,7 @@ class LidarCameraProjectionNode(Node):
         px = np.column_stack((gx, gy)).astype(np.int32)
         return xyz_cam, px
 
+
     def voxel_downsample_with_color(self, xyz_lidar, px, img_bgr, voxel_size):
         if xyz_lidar.shape[0] == 0:
             return np.zeros((0, 3), np.float32), np.zeros((0,), np.float32)
@@ -276,9 +291,7 @@ class LidarCameraProjectionNode(Node):
         keys = np.floor(xyz_lidar / vs).astype(np.int32)
         key_view = keys.view([('ix', np.int32), ('iy', np.int32), ('iz', np.int32)]).reshape(-1)
 
-        uniq, inv = np.unique(key_view, return_inverse=True)
-        nvox = uniq.shape[0]
-
+        _, inv = np.unique(key_view, return_inverse=True)
         cnt = np.bincount(inv)
 
         sx = np.bincount(inv, weights=xyz_lidar[:, 0])
