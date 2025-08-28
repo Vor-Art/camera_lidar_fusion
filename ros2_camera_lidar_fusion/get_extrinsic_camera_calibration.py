@@ -101,13 +101,39 @@ class CameraLidarExtrinsicNode(Node):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
+        # Save as YAML (human-readable, aligned YAML-like)
         out_yaml = os.path.join(self.output_dir, self.file)
-        data_out = {
-            "extrinsic_matrix": T_lidar_to_cam.tolist()
-        }
+        
+        R = T_lidar_to_cam[0:3, 0:3]
+        t = T_lidar_to_cam[0:3, 3]
+        R_flat = R.flatten()
+        t_list = t
 
         with open(out_yaml, 'w') as f:
-            yaml.dump(data_out, f, sort_keys=False)
+            f.write("\n")
+            f.write("# (LiDAR -> Camera)\n")
+
+            # translation
+            t_str = ", ".join(f"{val: .8f}" for val in t_list)
+            f.write(f"translation: [{t_str}]\n")
+
+            # rotation (flattened, 3 per row)
+            f.write("rotation:    [")
+            for i, val in enumerate(R_flat):
+                sep = "," if i < len(R_flat)-1 else ""
+                f.write(f"{val: .8f}{sep} ")
+                if (i+1) % 3 == 0 and i < len(R_flat)-1:
+                    f.write("\n              ")
+            f.write("]\n")
+
+            # transformation matrix
+            f.write("transformation_matrix:\n")
+            for row in T_lidar_to_cam:
+                row_str = ", ".join(f"{val: .8f}" for val in row)
+                f.write(f"  - [{row_str}]\n")
+
+
+        
 
         self.get_logger().info(f"Extrinsic matrix saved to: {out_yaml}")
 

@@ -9,169 +9,299 @@ import numpy as np
 import yaml
 import struct
 
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
 from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
+import sensor_msgs_py.point_cloud2 as pc2
+from std_msgs.msg import Header
 
 from ros2_camera_lidar_fusion.read_yaml import extract_configuration
 
 
+# ----------------- Loaders -----------------
 def load_extrinsic_matrix(yaml_path: str) -> np.ndarray:
-    if not os.path.isfile(yaml_path):
-        raise FileNotFoundError(f"No extrinsic file found: {yaml_path}")
-
     with open(yaml_path, 'r') as f:
         data = yaml.safe_load(f)
-
-    if 'extrinsic_matrix' not in data:
-        raise KeyError(f"YAML {yaml_path} has no 'extrinsic_matrix' key.")
-
-    matrix_list = data['extrinsic_matrix']
-    T = np.array(matrix_list, dtype=np.float64)
+    if 'transformation_matrix' not in data:
+        raise KeyError(f"YAML {yaml_path} has no 'transformation_matrix' key.")
+    T = np.array(data['transformation_matrix'], dtype=np.float64)
     if T.shape != (4, 4):
         raise ValueError("Extrinsic matrix is not 4x4.")
     return T
 
-def load_camera_calibration(yaml_path: str) -> (np.ndarray, np.ndarray):
-    if not os.path.isfile(yaml_path):
-        raise FileNotFoundError(f"No camera calibration file: {yaml_path}")
+def invert_h(T: np.ndarray) -> np.ndarray:
+    R = T[:3, :3]; t = T[:3, 3]
+    Ti = np.eye(4)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+    return Ti
 
-    with open(yaml_path, 'r') as f:
-        calib_data = yaml.safe_load(f)
+def transform_points(pts_xyz: np.ndarray, T: np.ndarray) -> np.ndarray:
+    N = pts_xyz.shape[0]
+    pts_h = np.hstack((pts_xyz.astype(np.float64), np.ones((N, 1))))
+    out = (pts_h @ T.T)[:, :3]
+    return out.astype(np.float32)
 
-    cam_mat_data = calib_data['camera_matrix']['data']
-    camera_matrix = np.array(cam_mat_data, dtype=np.float64)
+def voxelize_points_with_color(points_rgba: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    Voxelize Nx4 points [x,y,z,rgb_float].
+    RGB is averaged inside each voxel.
+    """
+    if points_rgba.shape[0] == 0:
+        return points_rgba
 
-    dist_data = calib_data['distortion_coefficients']['data']
-    dist_coeffs = np.array(dist_data, dtype=np.float64).reshape((1, -1))
+    coords = points_rgba[:, :3]
+    colors = points_rgba[:, 3]
 
-    return camera_matrix, dist_coeffs
+    vs = float(voxel_size)
+    grid = np.floor(coords / vs).astype(np.int64)
+    uniq, inv, counts = np.unique(grid, axis=0, return_inverse=True, return_counts=True)
 
+    sums_xyz = np.zeros((uniq.shape[0], 3), dtype=np.float64)
+    np.add.at(sums_xyz, inv, coords)
+    sums_rgb = np.zeros((uniq.shape[0],), dtype=np.float64)
+    np.add.at(sums_rgb, inv, colors)
 
-def pointcloud2_to_xyz_array_fast(cloud_msg: PointCloud2, skip_rate: int = 1) -> np.ndarray:
-    if cloud_msg.height == 0 or cloud_msg.width == 0:
+    xyz_mean = sums_xyz / counts[:, None]
+    rgb_mean = sums_rgb / counts
+    return np.column_stack((xyz_mean.astype(np.float32), rgb_mean.astype(np.float32)))
+
+# ----------------- Utils -----------------
+def pointcloud2_to_xyz_array_fast(msg: PointCloud2, skip_rate: int = 1) -> np.ndarray:
+    if msg.height == 0 or msg.width == 0:
         return np.zeros((0, 3), dtype=np.float32)
-
-    field_names = [f.name for f in cloud_msg.fields]
-    if not all(k in field_names for k in ('x','y','z')):
-        return np.zeros((0,3), dtype=np.float32)
-
-    x_field = next(f for f in cloud_msg.fields if f.name=='x')
-    y_field = next(f for f in cloud_msg.fields if f.name=='y')
-    z_field = next(f for f in cloud_msg.fields if f.name=='z')
-
+    fields = [f.name for f in msg.fields]
+    if not all(k in fields for k in ('x', 'y', 'z')):
+        return np.zeros((0, 3), dtype=np.float32)
     dtype = np.dtype([
         ('x', np.float32),
         ('y', np.float32),
         ('z', np.float32),
-        ('_', 'V{}'.format(cloud_msg.point_step - 12))
+        ('_', f'V{msg.point_step - 12}')
     ])
+    raw = np.frombuffer(msg.data, dtype=dtype)
+    pts = np.vstack((raw['x'], raw['y'], raw['z'])).T
+    return pts[::skip_rate] if skip_rate > 1 else pts
 
-    raw_data = np.frombuffer(cloud_msg.data, dtype=dtype)
-    points = np.zeros((raw_data.shape[0], 3), dtype=np.float32)
-    points[:,0] = raw_data['x']
-    points[:,1] = raw_data['y']
-    points[:,2] = raw_data['z']
-
-    if skip_rate > 1:
-        points = points[::skip_rate]
-
-    return points
 
 class LidarCameraProjectionNode(Node):
     def __init__(self):
         super().__init__('lidar_camera_projection_node')
-        
-        config_file = extract_configuration()
-        if config_file is None:
-            self.get_logger().error("Failed to extract configuration file.")
-            return
-        
-        config_folder = config_file['general']['config_folder']
-        extrinsic_yaml = config_file['general']['camera_extrinsic_calibration']
-        extrinsic_yaml = os.path.join(config_folder, extrinsic_yaml)
+
+        cfg = extract_configuration()
+        cfg_folder = cfg['general']['config_folder']
+
+        extrinsic_yaml = os.path.join(cfg_folder, cfg['general']['camera_extrinsic_calibration'])
         self.T_lidar_to_cam = load_extrinsic_matrix(extrinsic_yaml)
+        self.T_cam_to_lidar = invert_h(self.T_lidar_to_cam)
 
-        camera_yaml = config_file['general']['camera_intrinsic_calibration']
-        camera_yaml = os.path.join(config_folder, camera_yaml)
-        self.camera_matrix, self.dist_coeffs = load_camera_calibration(camera_yaml)
+        # camera intrinsics from CameraInfo
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.flip_method = cfg['camera']['flip_method']  # -1, 0, 1 or anything else -> no flip
 
-        self.get_logger().info("Loaded extrinsic:\n{}".format(self.T_lidar_to_cam))
-        self.get_logger().info("Camera matrix:\n{}".format(self.camera_matrix))
-        self.get_logger().info("Distortion coeffs:\n{}".format(self.dist_coeffs))
+        cam_info_topic = cfg['camera']['info_topic']
+        self.create_subscription(CameraInfo, cam_info_topic, self.camera_info_cb, 1)
 
-        lidar_topic = config_file['lidar']['lidar_topic']
-        image_topic = config_file['camera']['image_topic']
-        self.get_logger().info(f"Subscribing to lidar topic: {lidar_topic}")
-        self.get_logger().info(f"Subscribing to image topic: {image_topic}")
-
+        # subs + sync
+        image_topic = cfg['camera']['image_topic']
+        lidar_topic = cfg['lidar']['lidar_topic']
         self.image_sub = Subscriber(self, Image, image_topic)
         self.lidar_sub = Subscriber(self, PointCloud2, lidar_topic)
-
-        self.ts = ApproximateTimeSynchronizer(
-            [self.image_sub, self.lidar_sub],
-            queue_size=5,
-            slop=0.07
-        )
+        self.ts = ApproximateTimeSynchronizer([self.image_sub, self.lidar_sub], queue_size=5, slop=0.07)
         self.ts.registerCallback(self.sync_callback)
 
-        projected_topic = config_file['camera']['projected_topic']
-        self.pub_image = self.create_publisher(Image, projected_topic, 1)
-        self.bridge = CvBridge()
+        # pubs
+        projected_topic_pub = cfg['output']['projected_topic_pub']
+        lidar_in_camera_pub = cfg['output']['lidar_in_camera_pub']
+        self.pub_image = self.create_publisher(Image, projected_topic_pub, 1)
+        self.pub_cloud = self.create_publisher(PointCloud2, lidar_in_camera_pub, 1)
 
+        self.bridge = CvBridge()
         self.skip_rate = 1
 
+        # densify parameters
+        dp = cfg['densify_parameters']
+        self.grid_step_px   = int(dp['grid_step_px'])   # uniform spacing on image plane
+        self.fill_iters     = int(dp['fill_iters'])     # hole-fill iterations
+        self.voxel_size_m   = float(dp['voxel_size_m']) # voxel size in LiDAR frame (m)
+
+        self.get_logger().info(f"Loaded extrinsic:\n{self.T_lidar_to_cam}")
+
+    def camera_info_cb(self, msg: CameraInfo):
+        if self.camera_matrix is not None:
+            return
+        self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        self.dist_coeffs = np.array(msg.d, dtype=np.float64).reshape(1, -1)
+
+        self.get_logger().info(f"Got camera intrinsics from CameraInfo:\n{self.camera_matrix}")
+        self.get_logger().info(f"Distortion coeffs: {self.dist_coeffs}")
+
     def sync_callback(self, image_msg: Image, lidar_msg: PointCloud2):
+        if self.camera_matrix is None:
+            return
+
         cv_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
 
+        # --- Convert cloud ---
         xyz_lidar = pointcloud2_to_xyz_array_fast(lidar_msg, skip_rate=self.skip_rate)
-        n_points = xyz_lidar.shape[0]
-        if n_points == 0:
-            self.get_logger().warn("Empty cloud. Nothing to project.")
-            out_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
-            out_msg.header = image_msg.header
-            self.pub_image.publish(out_msg)
+        if xyz_lidar.shape[0] == 0:
             return
 
-        xyz_lidar_f64 = xyz_lidar.astype(np.float64)
-        ones = np.ones((n_points, 1), dtype=np.float64)
-        xyz_lidar_h = np.hstack((xyz_lidar_f64, ones))
-
-        xyz_cam_h = xyz_lidar_h @ self.T_lidar_to_cam.T
-        xyz_cam = xyz_cam_h[:, :3]
-
-        mask_in_front = (xyz_cam[:, 2] > 0.0)
-        xyz_cam_front = xyz_cam[mask_in_front]
-        n_front = xyz_cam_front.shape[0]
-        if n_front == 0:
-            self.get_logger().info("No points in front of camera (z>0).")
-            out_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
-            out_msg.header = image_msg.header
-            self.pub_image.publish(out_msg)
+        # --- Transform LiDAR → Camera ---
+        ones = np.ones((xyz_lidar.shape[0], 1))
+        xyz_cam = (np.hstack((xyz_lidar, ones)) @ self.T_lidar_to_cam.T)[:, :3]
+        # keep only points in front
+        mask_in_front = xyz_cam[:, 2] > 0.0
+        xyz_cam = xyz_cam[mask_in_front]
+        if xyz_cam.shape[0] == 0:
             return
-        
-        rvec = np.zeros((3,1), dtype=np.float64)
-        tvec = np.zeros((3,1), dtype=np.float64)
-        image_points, _ = cv2.projectPoints(
-            xyz_cam_front,
-            rvec, tvec,
-            self.camera_matrix,
-            self.dist_coeffs
-        )
+
+        # --- Project to 2D ---
+        rvec = np.zeros((3,1))
+        tvec = np.zeros((3,1))
+        image_points, _ = cv2.projectPoints(xyz_cam, rvec, tvec, self.camera_matrix, self.dist_coeffs)
         image_points = image_points.reshape(-1, 2)
 
-        h, w = cv_image.shape[:2]
-        for (u, v) in image_points:
-            u_int = int(u + 0.5)
-            v_int = int(v + 0.5)
-            if 0 <= u_int < w and 0 <= v_int < h:
-                cv2.circle(cv_image, (u_int, v_int), 2, (0, 255, 0), -1)
+        # --- Draw on image (OpenCV preview) ---
+        cv_image_draw = cv_image.copy()
+        h, w = cv_image_draw.shape[:2]
+        u = np.round(image_points[:, 0]).astype(np.int32)
+        v = np.round(image_points[:, 1]).astype(np.int32)
+        mask = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        if not np.any(mask):
+            return
 
-        out_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
-        out_msg.header = image_msg.header
-        self.pub_image.publish(out_msg)
+        # Apply mask consistently to all
+        xyz_cam = xyz_cam[mask]; 
+        u = u[mask]; v = v[mask]; 
+        image_points = image_points[mask]
+
+        # draw sparse cv_image_draw
+        for uu, vv in zip(u, v):
+            cv2.circle(cv_image_draw, (int(uu), int(vv)), 2, (0, 255, 0), -1)
+        
+        if self.flip_method in [0, 1, -1]:
+            cv_image_draw = cv2.flip(cv_image_draw, self.flip_method)
+
+        out_img = self.bridge.cv2_to_imgmsg(cv_image_draw, encoding='bgr8')
+        out_img.header = image_msg.header
+        self.pub_image.publish(out_img)
+
+        # densify in image plane (z-buffer splat), backproject, color, publish
+        xyz_dense, px_dense = self.densify_depth_uniform(u, v, xyz_cam[:, 2], cv_image)
+        
+        # transform densified points from cam → lidar
+        xyz_dense_lidar = transform_points(xyz_dense, self.T_cam_to_lidar)
+        hdr_dense = Header()
+        hdr_dense.stamp = image_msg.header.stamp
+        hdr_dense.frame_id = lidar_msg.header.frame_id or "lidar"
+
+        xyz_v, rgb_v = self.voxel_downsample_with_color(xyz_dense_lidar, px_dense, cv_image, self.voxel_size_m)
+
+        self.publish_colored_cloud(xyz_v, rgb_v, hdr_dense)
+        # self.publish_colored_cloud(cv_image, xyz_cam, image_points, image_msg.header)
+    
+
+    def publish_colored_cloud(self, xyz_points, rgb_float, header):
+        if xyz_points.shape[0] == 0:
+            return
+
+        pts = np.column_stack((xyz_points.astype(np.float32),
+                            rgb_float.astype(np.float32)))
+
+        fields = [
+            PointField(name='x',   offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='y',   offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='z',   offset=8,  datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        cloud_msg = pc2.create_cloud(header, fields, pts.tolist())
+        self.pub_cloud.publish(cloud_msg)
+
+    def densify_depth_uniform(self, u, v, z, img):
+        h, w = img.shape[:2]
+        fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
+        cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
+
+        # z-buffer at pixel centers (vectorized, no Python loops)
+        depth = np.full((h * w,), np.inf, np.float32)
+        idx = (v.astype(np.int64) * w + u.astype(np.int64))
+        np.minimum.at(depth, idx, z.astype(np.float32))
+        depth = depth.reshape(h, w)
+
+        # iterative neighbor-averaging hole fill (fast)
+        valid = np.isfinite(depth).astype(np.float32)
+        for _ in range(max(1, self.fill_iters)):
+            num = cv2.blur(np.where(np.isfinite(depth), depth, 0.0), ksize=(3, 3), borderType=cv2.BORDER_REPLICATE)
+            den = cv2.blur(valid, ksize=(3, 3), borderType=cv2.BORDER_REPLICATE)
+            fill_mask = (np.isfinite(depth) == False) & (den > 0)
+            if not np.any(fill_mask):
+                break
+            depth[fill_mask] = (num[fill_mask] / den[fill_mask]).astype(np.float32)
+            valid[fill_mask] = 1.0
+
+        # uniform sampling on a grid
+        xs = np.arange(0, w, max(1, self.grid_step_px), dtype=np.int32)
+        ys = np.arange(0, h, max(1, self.grid_step_px), dtype=np.int32)
+        gx, gy = np.meshgrid(xs, ys)
+        gx = gx.ravel(); gy = gy.ravel()
+
+        good = np.isfinite(depth[gy, gx])
+        if not np.any(good):
+            return np.zeros((0, 3), np.float32), np.zeros((0, 2), np.int32)
+
+        gx = gx[good]; gy = gy[good]
+        d  = depth[gy, gx].astype(np.float64)
+
+        X = (gx.astype(np.float64) - cx) / fx * d
+        Y = (gy.astype(np.float64) - cy) / fy * d
+        Z = d
+        xyz_cam = np.column_stack((X, Y, Z)).astype(np.float32)
+        px = np.column_stack((gx, gy)).astype(np.int32)
+        return xyz_cam, px
+
+    def voxel_downsample_with_color(self, xyz_lidar, px, img_bgr, voxel_size):
+        if xyz_lidar.shape[0] == 0:
+            return np.zeros((0, 3), np.float32), np.zeros((0,), np.float32)
+
+        # colors from image pixels
+        bgr = img_bgr[px[:, 1], px[:, 0], :]
+        r = bgr[:, 2].astype(np.float32)
+        g = bgr[:, 1].astype(np.float32)
+        b = bgr[:, 0].astype(np.float32)
+
+        # voxel keys
+        vs = float(voxel_size)
+        keys = np.floor(xyz_lidar / vs).astype(np.int32)
+        key_view = keys.view([('ix', np.int32), ('iy', np.int32), ('iz', np.int32)]).reshape(-1)
+
+        uniq, inv = np.unique(key_view, return_inverse=True)
+        nvox = uniq.shape[0]
+
+        cnt = np.bincount(inv)
+
+        sx = np.bincount(inv, weights=xyz_lidar[:, 0])
+        sy = np.bincount(inv, weights=xyz_lidar[:, 1])
+        sz = np.bincount(inv, weights=xyz_lidar[:, 2])
+
+        sr = np.bincount(inv, weights=r)
+        sg = np.bincount(inv, weights=g)
+        sb = np.bincount(inv, weights=b)
+
+        xyz_ds = np.stack((sx / cnt, sy / cnt, sz / cnt), axis=1).astype(np.float32)
+
+        r_avg = (sr / cnt).astype(np.uint32)
+        g_avg = (sg / cnt).astype(np.uint32)
+        b_avg = (sb / cnt).astype(np.uint32)
+
+        rgb_u32 = (r_avg << 16) | (g_avg << 8) | b_avg
+        rgb_f32 = rgb_u32.view(np.float32)
+        return xyz_ds, rgb_f32
 
 
+
+# ----------------- Main -----------------
 def main(args=None):
     rclpy.init(args=args)
     node = LidarCameraProjectionNode()

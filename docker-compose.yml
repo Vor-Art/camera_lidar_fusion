@@ -1,0 +1,49 @@
+services:
+  ros2_camera_lidar_fusion:
+    container_name: ros2_camera_lidar_fusion
+    build:
+      context: .                # repo root
+      dockerfile: docker/Dockerfile
+    image: ros2_camera_lidar_fusion:latest
+    stdin_open: true
+    tty: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.docker.xauth
+    volumes:
+      - $XAUTHORITY:/tmp/.docker.xauth
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - .:/ros2_ws/src/ros2_camera_lidar_fusion
+      - ../data:/data
+    working_dir: /ros2_ws
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true
+
+  rviz2:
+    container_name: rviz2
+    build:
+      context: .                # repo root
+      dockerfile: docker/Dockerfile
+    image: ros2_camera_lidar_fusion:latest
+    stdin_open: true
+    tty: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.docker.xauth
+    volumes:
+      - $XAUTHORITY:/tmp/.docker.xauth
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - .:/ros2_ws/src/ros2_camera_lidar_fusion
+      - ../data:/data
+    working_dir: /ros2_ws
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true
+    command: >
+      bash -lc "source /opt/ros/humble/setup.bash &&
+                rviz2 -d /ros2_ws/src/ros2_camera_lidar_fusion/rviz_cfg/rviz_cfg.rviz"

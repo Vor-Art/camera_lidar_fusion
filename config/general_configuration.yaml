@@ -1,20 +1,33 @@
 lidar:
-  lidar_topic: /rslidar_points
-  frame_id: rslidar
+  lidar_topic: /velodyne_points
+
+output:
+  projected_topic_pub: /projected_image
+  lidar_in_camera_pub: /lidar_in_camera
+
+densify_parameters:
+  grid_step_px: 4          # uniform spacing on image plane
+  fill_iters: 12            # hole-fill iterations
+  voxel_size_m: 0.01       # voxel size in LiDAR frame (m)
+
+  # grid_step_px ↓ (e.g., 2) → denser image-plane sampling; ↑ → sparser.
+  # fill_iters 3–6 usually enough; more is slower.
+  # voxel_size_m 0.05–0.10 for outdoors, 0.02–0.05 for indoors.
 
 camera:
-  image_topic: /pcl_human_segmentation/camera/raw_image
-  projected_topic: /pcl_human_segmentation/camera/projected_image
+  image_topic: /camera/camera/color/image_raw
+  info_topic: /camera/camera/color/camera_info
   image_size:
     width: 640
     height: 480
-  frame_id: camera
+  flip_method: -1       # Should algorithm flip the image: -2 = disabled, 0=vertical, 1=horizontal, -1=both
+
 
 chessboard:
   pattern_size:
-    rows: 7
-    columns: 9
-  square_size_meters: 0.41
+    rows: 5
+    columns: 8
+  square_size_meters: 0.10
 
 general:
   config_folder: /ros2_ws/src/ros2_camera_lidar_fusion/config
@@ -23,7 +36,7 @@ general:
   camera_intrinsic_calibration: camera_intrinsic_calibration.yaml
   camera_extrinsic_calibration: camera_extrinsic_calibration.yaml
   slop: 0.1
-  max_file_saved: 10
+  max_file_saved: 40
   keyboard_listener: True
   get_intrinsics: True
   get_extrinsics: True

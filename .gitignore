@@ -6,3 +6,5 @@ camera_intrinsic_calibration.yaml
 .vscode
 log
 /data
+__pycache__/
+data copy/

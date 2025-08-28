@@ -91,6 +91,8 @@ class ImageCloudCorrespondenceNode(Node):
 
         self.get_logger().info("\n[Open3D Instructions]")
         self.get_logger().info("  - Shift + left click to select a point")
+        self.get_logger().info("  - Use mouse drag + scroll for orbit/zoom")
+        self.get_logger().info("  - Press 'F' to focus on geometry")
         self.get_logger().info("  - Press 'q' or ESC to close the window when finished\n")
 
         vis = o3d.visualization.VisualizerWithEditing()
@@ -98,12 +100,19 @@ class ImageCloudCorrespondenceNode(Node):
         vis.add_geometry(pcd)
 
         render_opt = vis.get_render_option()
-        render_opt.point_size = 2.0
+        render_opt.point_size = 3.5
+
+        # Camera setup: allow free orbit/zoom
+        ctr = vis.get_view_control()
+        ctr.set_zoom(0.8)      # start closer
+        ctr.set_front([0, 0, -1])
+        ctr.set_lookat(pcd.get_center())
+        ctr.set_up([0, -1, 0])
 
         vis.run()
         vis.destroy_window()
-        picked_indices = vis.get_picked_points()
 
+        picked_indices = vis.get_picked_points()
         np_points = np.asarray(pcd.points)
         picked_xyz = []
         for idx in picked_indices:
@@ -112,6 +121,7 @@ class ImageCloudCorrespondenceNode(Node):
             self.get_logger().info(f"Cloud: index={idx}, coords=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f})")
 
         return picked_xyz
+
 
     def process_file_pairs(self):
         file_pairs = self.get_file_pairs(self.data_dir)
@@ -131,19 +141,21 @@ class ImageCloudCorrespondenceNode(Node):
             self.get_logger().info("========================================\n")
 
             image_points = self.pick_image_points(png_path)
-            self.get_logger().info(f"\nSelected {len(image_points)} points in the image.\n")
+            self.get_logger().info(f"Selected {len(image_points)} points in the image.\n")
 
             cloud_points = self.pick_cloud_points(pcd_path)
-            self.get_logger().info(f"\nSelected {len(cloud_points)} points in the cloud.\n")
+            self.get_logger().info(f"Selected {len(cloud_points)} points in the cloud.\n")
 
             out_txt = os.path.join(self.data_dir, self.file)
-            with open(out_txt, 'w') as f:
+            with open(out_txt, 'a') as f:   # append mode
+                f.write(f"# Pair: {prefix}\n")
                 f.write("# u, v, x, y, z\n")
                 min_len = min(len(image_points), len(cloud_points))
                 for i in range(min_len):
                     (u, v) = image_points[i]
                     (x, y, z) = cloud_points[i]
                     f.write(f"{u},{v},{x},{y},{z}\n")
+                f.write("\n")  # blank line between pairs
 
             self.get_logger().info(f"Saved {min_len} correspondences in: {out_txt}")
             self.get_logger().info("========================================")

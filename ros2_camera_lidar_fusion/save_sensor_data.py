@@ -25,9 +25,11 @@ class SaveData(Node):
         self.max_file_saved = config_file['general']['max_file_saved']
         self.storage_path = config_file['general']['data_folder']
         self.image_topic = config_file['camera']['image_topic']
+        self.flip_method = config_file['camera']['flip_method']
         self.lidar_topic = config_file['lidar']['lidar_topic']
         self.keyboard_listener_enabled = config_file['general']['keyboard_listener']
         self.slop = config_file['general']['slop']
+
 
         if not os.path.exists(self.storage_path):
             os.makedirs(self.storage_path)
@@ -69,14 +71,17 @@ class SaveData(Node):
     def synchronize_data(self, image_msg, pointcloud_msg):
         """Handles synchronized messages and saves data if the flag is set."""
         if self.save_data_flag:
-            file_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.get_logger().info(f'Synchronizing data at {file_name}')
-            total_files = len(os.listdir(self.storage_path))
-            if total_files < self.max_file_saved:
-                self.save_data(image_msg, pointcloud_msg, file_name)
-                if self.keyboard_listener_enabled:
-                    self.save_data_flag = False
 
+            file_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            total_files = len(os.listdir(self.storage_path))/2
+            if total_files < self.max_file_saved:
+                self.get_logger().info(f'Synchronizing data at {file_name}')
+                self.save_data(image_msg, pointcloud_msg, file_name)
+            else:
+                self.get_logger().info(f'To many data {total_files=}')
+                
+            if self.keyboard_listener_enabled:
+                self.save_data_flag = False
     def pointcloud2_to_open3d(self, pointcloud_msg):
         """Converts a PointCloud2 message to an Open3D point cloud."""
         points = []
@@ -90,6 +95,8 @@ class SaveData(Node):
         """Saves image and point cloud data to the storage path."""
         bridge = CvBridge()
         image = bridge.imgmsg_to_cv2(image_msg, 'bgr8')
+        if self.flip_method in [0, 1, -1]:
+            image = cv2.flip(image, self.flip_method)
         pointcloud = self.pointcloud2_to_open3d(pointcloud_msg)
         o3d.io.write_point_cloud(f'{self.storage_path}/{file_name}.pcd', pointcloud)
         cv2.imwrite(f'{self.storage_path}/{file_name}.png', image)

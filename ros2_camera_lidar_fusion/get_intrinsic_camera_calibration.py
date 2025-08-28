@@ -27,11 +27,14 @@ class CameraCalibrationNode(Node):
         self.image_topic = config_file['camera']['image_topic']
         self.image_width = config_file['camera']['image_size']['width']
         self.image_height = config_file['camera']['image_size']['height']
+        self.flip_method = config_file['camera']['flip_method']
 
         self.output_path = config_file['general']['config_folder']
         self.file = config_file['general']['camera_intrinsic_calibration']
 
         self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, 10)
+        self.get_logger().info(f"{self.image_topic=}")
+
         self.bridge = CvBridge()
 
         self.obj_points = []
@@ -42,37 +45,66 @@ class CameraCalibrationNode(Node):
         self.objp *= self.square_size
 
         self.get_logger().info("Camera calibration node initialized. Waiting for images...")
+        self.i = 0
+        self.log_mode = 2
 
     def image_callback(self, msg):
+        self.i += 1
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if self.flip_method in [0, 1, -1]:
+                cv_image = cv2.flip(cv_image, self.flip_method)
             gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-            ret, corners = cv2.findChessboardCorners(gray, (self.chessboard_cols, self.chessboard_rows), None)
+            ret, corners = cv2.findChessboardCorners(
+                gray, (self.chessboard_cols, self.chessboard_rows), None
+            )
 
             if ret:
-                self.obj_points.append(self.objp)
                 refined_corners = cv2.cornerSubPix(
                     gray, corners, (11, 11), (-1, -1),
                     criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
                 )
-                self.img_points.append(refined_corners)
+                cv2.drawChessboardCorners(
+                    cv_image, (self.chessboard_cols, self.chessboard_rows),
+                    refined_corners, ret
+                )
 
-                cv2.drawChessboardCorners(cv_image, (self.chessboard_cols, self.chessboard_rows), refined_corners, ret)
-                self.get_logger().info("Chessboard detected and points added.")
+                # Show info but don’t save automatically
+                if self.log_mode != 1:
+                    self.log_mode = 1
+                    print()
+                print(f"Board detected [i={self.i}] - press 's' to save", end="\r")
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('s'):   # user presses 's' → save this one
+                    self.obj_points.append(self.objp)
+                    self.img_points.append(refined_corners)
+                    print(f"\nSaved chessboard #{len(self.obj_points)}")
+
+                elif key == ord('q'): # user presses 'q' → quit + save calibration
+                    print("\nQuitting...")
+                    self.save_calibration()
+                    rclpy.shutdown()
+
             else:
-                self.get_logger().warn("Chessboard not detected in image.")
+                if self.log_mode != 0:
+                    self.log_mode = 0
+                    print()
+                print(f"Chessboard not detected [i={self.i}]", end="\r")
 
             cv2.imshow("Image", cv_image)
-            cv2.waitKey(1)
 
         except Exception as e:
             self.get_logger().error(f"Failed to process image: {e}")
+
 
     def save_calibration(self):
         if len(self.obj_points) < 10:
             self.get_logger().error("Not enough images for calibration. At least 10 are required.")
             return
+
+        self.get_logger().info("Calculating the intrinsics ...")
 
         ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
             self.obj_points, self.img_points, (self.image_width, self.image_height), None, None

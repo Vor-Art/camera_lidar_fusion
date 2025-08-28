@@ -44,8 +44,10 @@ RUN apt-get install -y \
 ###### Build the workspace
 RUN mkdir -p /ros2_ws/src
 WORKDIR /ros2_ws
-RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc
-RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && colcon build"
+COPY . /ros2_ws/src/ros2_camera_lidar_fusion
+RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && colcon build --symlink-install"
 
 ###### Source the workspace
 RUN echo "source /ros2_ws/install/setup.bash" >> ~/.bashrc
+
+
