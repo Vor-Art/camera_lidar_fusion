@@ -29,6 +29,10 @@ class SaveData(Node):
         self.keyboard_listener_enabled = config_file['general']['keyboard_listener']
         self.slop = config_file['general']['slop']
 
+        # pubs
+        projected_topic_pub = config_file['output']['projected_topic_pub']
+        self.pub_image = self.create_publisher(Image, projected_topic_pub, 1)
+
         if not os.path.exists(self.storage_path):
             os.makedirs(self.storage_path)
         self.get_logger().warn(f'Data will be saved at {self.storage_path}')
@@ -78,6 +82,8 @@ class SaveData(Node):
             self._cached_image_msg = image_msg
             self._cached_pointcloud_msg = pointcloud_msg
             self._data_available.set()
+
+        self.pub_image.publish(image_msg)
 
         # If we are in auto-save mode, save every synchronized pair.
         if not self.keyboard_listener_enabled and self.save_data_flag:

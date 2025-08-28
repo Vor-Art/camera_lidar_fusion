@@ -28,6 +28,16 @@ class PCDGui:
 
         self._pt_size = 3.0        # default point size
 
+        self._click_queue = []     # (x, y) pixels in widget coords
+        self._key_queue = []       # 'u','s','q'
+        self._markers = []         # [(name_sphere, label_handle|None)]
+        self._pcd_name = "pcd"
+
+        self._last_down_t = 0.0
+        self._dbl_thr_s = 0.35
+
+        self._ghost = None   # (name, lbl)
+
         # point cloud material (point size lives here)
         self.pcd_mat = rendering.MaterialRecord()
         self.pcd_mat.shader = "defaultUnlit"
@@ -37,15 +47,13 @@ class PCDGui:
         self.marker_mat = rendering.MaterialRecord()
         self.marker_mat.shader = "unlitSolidColor"
         self.marker_mat.base_color = (1.0, 0.0, 0.0, 1.0)
+        
+        # point ghost material
+        self.ghost_mat = rendering.MaterialRecord()
+        self.ghost_mat.shader = "unlitSolidColor"
+        self.ghost_mat.base_color = (1.0, 1.0, 0.0, 0.3)
+        self.ghost_mat.point_size = 5.0
 
-        self._click_queue = []     # (x, y) pixels in widget coords
-        self._key_queue = []       # 'u','s','q'
-        self._markers = []         # [(name_sphere, label_handle|None)]
-        self._pcd_name = "pcd"
-        self.T_guess = None
-
-        self._last_down_t = 0.0
-        self._dbl_thr_s = 0.35
 
         # # --- compat shim for return values ---
         try:
@@ -96,7 +104,7 @@ class PCDGui:
             self.scene.scene.modify_geometry_material(self._pcd_name, self.pcd_mat)
         except Exception:
             pass
-
+    
     def clear(self):
         # remove old markers
         for name, lbl in self._markers:
@@ -109,6 +117,7 @@ class PCDGui:
                     self.scene.remove_3d_label(lbl)
             except Exception:
                 pass
+        self._ghost = None
         self._markers.clear()
 
     def set_pointcloud(self, pcd: o3d.geometry.PointCloud):
@@ -146,6 +155,28 @@ class PCDGui:
         except Exception:
             pass
         self._markers.append((name, lbl))
+
+    def set_ghost_marker(self, pos: np.ndarray):
+        # remove old
+        if self._ghost:
+            name, lbl = self._ghost
+            try: self.scene.scene.remove_geometry(name)
+            except: pass
+            try: self.scene.remove_3d_label(lbl)
+            except: pass
+            self._ghost = None
+        if pos is None:
+            return
+        sph = o3d.geometry.TriangleMesh.create_sphere(0.03)
+        sph.compute_vertex_normals()
+        sph.paint_uniform_color([1.0, 1.0, 0.0])
+        sph.translate(pos.astype(float))
+        name = "ghost_marker"
+        self.scene.scene.add_geometry(name, sph, self.ghost_mat)
+        lbl = None
+        try: lbl = self.scene.add_3d_label(pos.astype(float), "o")
+        except: pass
+        self._ghost = (name, lbl)
 
     def undo_marker(self):
         if not self._markers:
@@ -225,6 +256,7 @@ class CorrespondenceTool(Node):
         self.o3d = PCDGui()
 
         # state
+        self._ghost_img = None   # (u,v)
         self._img_clicks = []
         self._pcd_points = []
         self._img_overlay = None
@@ -257,21 +289,24 @@ class CorrespondenceTool(Node):
 
     def _draw_image_overlay(self):
         show = self._img_base.copy()
-        # header
         msg = "LMB=add, u=undo, s=save-next, f=calculate, q=quit"
         cv2.putText(show, msg, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 230, 40), 2, cv2.LINE_AA)
 
-        # points with numbers (red dot + black number centered)
+        # real points
         for i, (u, v) in enumerate(self._img_overlay_points, start=1):
             cv2.circle(show, (int(u), int(v)), 7, (0, 0, 255), -1)
             txt = str(i)
             (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             cx, cy = int(u) - tw // 2, int(v) + th // 2 - 2
             cv2.putText(show, txt, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
-        return show
 
+        # ghost point (blue)
+        if self._ghost_img is not None:
+            u, v = self._ghost_img
+            cv2.circle(show, (int(u), int(v)), 6, (255, 0, 0), 2)  # hollow blue circle
+
+        return show
     def _update_prior_guess(self):
-        calib.calibrate_extrinsics(extr_file=self.extr_yaml)
         if os.path.isfile(self.extr_yaml):
             try:
                 self.T_guess = utils.load_extrinsic(self.extr_yaml)
@@ -283,7 +318,9 @@ class CorrespondenceTool(Node):
     def run(self):
         force_skip_mismatch = False
         force_skip_zero = False
-
+        
+        self._update_prior_guess()
+        
         # # reset file
         # open(self.out_txt, 'w').close()
 
@@ -301,6 +338,9 @@ class CorrespondenceTool(Node):
                 if img is None or pcd.is_empty():
                     self.get_logger().warn(f"Skip {name} (bad image/pcd).")
                     continue
+                
+                self._ghost_img = None
+                self.o3d.set_ghost_marker(None)
 
                 self._img_base = img
                 self._img_overlay_points = []
@@ -327,10 +367,31 @@ class CorrespondenceTool(Node):
                         self._pcd_points.append(pt.tolist())
                         self.o3d.add_marker(pt, len(self._pcd_points))
 
+                        # ghost: project into image
+                        if hasattr(self, "T_guess") and self.T_guess is not None:
+                            pc = utils.transform_points(self.T_guess, np.array([pt]))
+                            uv = utils.project_points(pc, self.K, self.D)[0]
+                            if 0 <= uv[0] < self.W and 0 <= uv[1] < self.H:
+                                self._ghost_img = (uv[0], uv[1])
+                            else:
+                                self._ghost_img = None
+
                 # image pending clicks
                 while self._img_clicks:
                     u, v = self._img_clicks.pop(0)
                     self._img_overlay_points.append((float(u), float(v)))
+
+                    # ghost: try to find 3D projection if extrinsics exist
+                    if hasattr(self, "T_guess") and self.T_guess is not None:
+                        # pick nearest projected point
+                        pc = utils.transform_points(self.T_guess, self._pcd_xyz)
+                        uv = utils.project_points(pc, self.K, self.D)
+                        d2 = np.sum((uv - np.array([u, v]))**2, axis=1)
+                        idx = np.argmin(d2)
+                        if np.sqrt(d2[idx]) < 15:   # pixel tolerance
+                            self.o3d.set_ghost_marker(self._pcd_xyz[idx])
+                        else:
+                            self.o3d.set_ghost_marker(None)
 
                 # draw image overlay
                 show = self._draw_image_overlay()
@@ -401,6 +462,7 @@ class CorrespondenceTool(Node):
             # move to next pair (save happens after loop with validation)
             self._go_next = True
         elif ch == 'f':
+            calib.calibrate_extrinsics(extr_file=self.extr_yaml)
             self._update_prior_guess()
         elif ch == 'q':
             self._quit = True
