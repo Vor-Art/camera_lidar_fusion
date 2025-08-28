@@ -98,14 +98,14 @@ class LidarCameraProjectionNode(Node):
         # camera intrinsics from CameraInfo
         self.camera_matrix = None
         self.dist_coeffs = None
-        self.flip_method = cfg['camera']['flip_method']  # -1, 0, 1 or anything else -> no flip
+        self.flip_method = cfg['output']['flip_method']
 
-        cam_info_topic = cfg['camera']['info_topic']
+        cam_info_topic = cfg['input']['info_topic']
         self.create_subscription(CameraInfo, cam_info_topic, self.camera_info_cb, 1)
 
         # subs + sync
-        image_topic = cfg['camera']['image_topic']
-        lidar_topic = cfg['lidar']['lidar_topic']
+        image_topic = cfg['input']['image_topic']
+        lidar_topic = cfg['input']['lidar_topic']
         self.image_sub = Subscriber(self, Image, image_topic)
         self.lidar_sub = Subscriber(self, PointCloud2, lidar_topic)
         self.ts = ApproximateTimeSynchronizer([self.image_sub, self.lidar_sub], queue_size=5, slop=0.07)

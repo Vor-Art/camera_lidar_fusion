@@ -1,34 +1,23 @@
-lidar:
+
+input:
+  image_topic: /camera/camera/color/image_raw
+  info_topic: /camera/camera/color/camera_info
   lidar_topic: /velodyne_points
 
 output:
   projected_topic_pub: /projected_image
   lidar_in_camera_pub: /lidar_in_camera
+  flip_method: -1       # Flip debug image: -2=no, 0=vertical, 1=horizontal, -1=both
 
 densify_parameters:
+  # Tips:
+  #    grid_step_px ↓ (e.g., 2) → denser image-plane sampling; ↑ → sparser.
+  #    fill_iters 3–6 usually enough; more is slower.
+  #    voxel_size_m 0.05–0.10 for outdoors, 0.02–0.05 for indoors.""""
   grid_step_px: 4          # uniform spacing on image plane
   fill_iters: 12           # hole-fill iterations
   voxel_size_m: 0.01       # voxel size in LiDAR frame (m)
   max_interp_dist: 0.2     # do not interpolate points with hier distance (m)
-
-  # grid_step_px ↓ (e.g., 2) → denser image-plane sampling; ↑ → sparser.
-  # fill_iters 3–6 usually enough; more is slower.
-  # voxel_size_m 0.05–0.10 for outdoors, 0.02–0.05 for indoors.
-
-camera:
-  image_topic: /camera/camera/color/image_raw
-  info_topic: /camera/camera/color/camera_info
-  image_size:
-    width: 640
-    height: 480
-  flip_method: -1       # Should algorithm flip the image: -2 = disabled, 0=vertical, 1=horizontal, -1=both
-
-
-chessboard:
-  pattern_size:
-    rows: 5
-    columns: 8
-  square_size_meters: 0.10
 
 general:
   config_folder: /ros2_ws/src/ros2_camera_lidar_fusion/config
