@@ -8,7 +8,7 @@ A ROS2 package for calculating **intrinsic** and **extrinsic calibration** betwe
 ## Visual Overview
 | **Static Sensors** | **Moving Sensors** |
 |---------------------|--------------------|
-| ![Static Sensors](assets/static_sensors.gif) width="400" | ![Moving Sensors](assets/moving_sensors.gif) width="400" |
+| ![Static Sensors](assets/static_sensors.gif) | ![Moving Sensors](assets/moving_sensors.gif) |
 
 ---
 

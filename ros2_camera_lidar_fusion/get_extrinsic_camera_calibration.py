@@ -1,154 +1,75 @@
 #!/usr/bin/env python3
-
-import os
-import yaml
-import numpy as np
-import cv2
+import os, numpy as np, yaml, cv2, rclpy
 from rclpy.node import Node
-import rclpy
-
 from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
+from ros2_camera_lidar_fusion.common import utils
 
-class CameraLidarExtrinsicNode(Node):
+class CalibrateExtrinsics(Node):
     def __init__(self):
-        super().__init__('camera_lidar_extrinsic_node')
-        
-        config_file = extract_configuration()
-        if config_file is None:
-            self.get_logger().error("Failed to extract configuration file.")
-            return
-        
-        self.corr_file = config_file['general']['correspondence_file']
-        self.corr_file = f'/ros2_ws/src/ros2_camera_lidar_fusion/data/{self.corr_file}'
-        self.camera_yaml = config_file['general']['camera_intrinsic_calibration']
-        self.camera_yaml = f'/ros2_ws/src/ros2_camera_lidar_fusion/config/{self.camera_yaml}'
-        self.output_dir = config_file['general']['config_folder']
-        self.file = config_file['general']['camera_extrinsic_calibration']
+        super().__init__('calibrate_extrinsics')
+        cfg = extract_configuration()
+        cfg_dir = cfg['general']['config_folder']
+        data_dir= cfg['general']['data_folder']
+        corr    = os.path.join(data_dir, cfg['general']['correspondence_file'])
+        intr    = os.path.join(cfg_dir,  cfg['general']['camera_intrinsic_calibration'])
+        outyml  = os.path.join(cfg_dir,  cfg['general']['camera_extrinsic_calibration'])
+        plotdir = os.path.join(data_dir,  "extrinsic_plots")
+        os.makedirs(plotdir, exist_ok=True)
 
-        self.get_logger().info('Starting extrinsic calibration...')
-        self.solve_extrinsic_with_pnp()
+        K, D, (W, H) = utils.load_intrinsics(intr)
+        pts2d, pts3d = utils.read_correspondences(corr)
+        if len(pts2d) < 8:
+            raise RuntimeError("Need >= 8 correspondences for robust solve")
 
-    def load_camera_calibration(self, yaml_path: str):
-        """Loads camera calibration parameters from a YAML file."""
-        if not os.path.isfile(yaml_path):
-            raise FileNotFoundError(f"Calibration file not found: {yaml_path}")
+        # try strict first, then relax
+        trials = [
+            dict(ransac_px=3.0, iters=5000),
+            dict(ransac_px=6.0, iters=7000),
+            dict(ransac_px=10.0, iters=9000),
+        ]
+        last_err = None
+        for tr in trials:
+            try:
+                print("N:", len(pts2d),
+                        "uv range:", pts2d.min(0), pts2d.max(0),
+                        "xyz norm median:", np.median(np.linalg.norm(pts3d, axis=1)))
 
-        with open(yaml_path, 'r') as f:
-            config = yaml.safe_load(f)
+                T, inl = utils.pnp_ransac_refine(pts3d, pts2d, K, D, **tr)
+                break
+            except Exception as e:
+                last_err = e
+        else:
+            raise last_err
 
-        mat_data = config['camera_matrix']['data']
-        camera_matrix = np.array(mat_data, dtype=np.float64)
-        dist_data = config['distortion_coefficients']['data']
-        dist_coeffs = np.array(dist_data, dtype=np.float64).reshape((1, -1))
+        # residuals + trimming as before...
+        res_all, proj_all = utils.residuals_px(T, pts3d, pts2d, K, D)
+        keep = utils.mad_trimming(res_all, k=3.0)
+        if keep.sum() >= 6:
+            T, inl2 = utils.pnp_ransac_refine(pts3d[keep], pts2d[keep], K, D,
+                                            ransac_px=2.5, iters=5000)
+            res_all, proj_all = utils.residuals_px(T, pts3d, pts2d, K, D)
 
-        return camera_matrix, dist_coeffs
+        utils.save_extrinsic_aligned(T, outyml)
+        # plots as you had
+        self.get_logger().info(f"Saved extrinsics → {outyml}")
 
-    def solve_extrinsic_with_pnp(self):
-        """Solves for extrinsic parameters using 2D-3D correspondences and camera calibration."""
-        camera_matrix, dist_coeffs = self.load_camera_calibration(self.camera_yaml)
-        self.get_logger().info(f"Camera matrix:\n{camera_matrix}")
-        self.get_logger().info(f"Distortion coefficients: {dist_coeffs}")
+        # plots
+        utils.plot_residuals(res_all, plotdir, tag="final")
+        utils.plot_quiver(W, H, pts2d, proj_all, os.path.join(plotdir,"residual_quiver.png"))
 
-        if not os.path.isfile(self.corr_file):
-            raise FileNotFoundError(f"Correspondence file not found: {self.corr_file}")
-
-        pts_2d = []
-        pts_3d = []
-        with open(self.corr_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                splitted = line.split(',')
-                if len(splitted) != 5:
-                    continue
-                u, v, X, Y, Z = [float(val) for val in splitted]
-                pts_2d.append([u, v])
-                pts_3d.append([X, Y, Z])
-
-        pts_2d = np.array(pts_2d, dtype=np.float64)
-        pts_3d = np.array(pts_3d, dtype=np.float64)
-
-        num_points = len(pts_2d)
-        self.get_logger().info(f"Loaded {num_points} correspondences from {self.corr_file}")
-
-        if num_points < 4:
-            raise ValueError("At least 4 correspondences are required for solvePnP")
-
-        success, rvec, tvec = cv2.solvePnP(
-            pts_3d,
-            pts_2d,
-            camera_matrix,
-            dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-
-        if not success:
-            raise RuntimeError("solvePnP failed to find a solution.")
-
-        self.get_logger().info("solvePnP succeeded.")
-        self.get_logger().info(f"rvec: {rvec.ravel()}")
-        self.get_logger().info(f"tvec: {tvec.ravel()}")
-
-        R, _ = cv2.Rodrigues(rvec)
-
-        T_lidar_to_cam = np.eye(4, dtype=np.float64)
-        T_lidar_to_cam[0:3, 0:3] = R
-        T_lidar_to_cam[0:3, 3] = tvec[:, 0]
-
-        self.get_logger().info(f"Transformation matrix (LiDAR -> Camera):\n{T_lidar_to_cam}")
-
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-
-        # Save as YAML (human-readable, aligned YAML-like)
-        out_yaml = os.path.join(self.output_dir, self.file)
-        
-        R = T_lidar_to_cam[0:3, 0:3]
-        t = T_lidar_to_cam[0:3, 3]
-        R_flat = R.flatten()
-        t_list = t
-
-        with open(out_yaml, 'w') as f:
-            f.write("\n")
-            f.write("# (LiDAR -> Camera)\n")
-
-            # translation
-            t_str = ", ".join(f"{val: .8f}" for val in t_list)
-            f.write(f"translation: [{t_str}]\n")
-
-            # rotation (flattened, 3 per row)
-            f.write("rotation:    [")
-            for i, val in enumerate(R_flat):
-                sep = "," if i < len(R_flat)-1 else ""
-                f.write(f"{val: .8f}{sep} ")
-                if (i+1) % 3 == 0 and i < len(R_flat)-1:
-                    f.write("\n              ")
-            f.write("]\n")
-
-            # transformation matrix
-            f.write("transformation_matrix:\n")
-            for row in T_lidar_to_cam:
-                row_str = ", ".join(f"{val: .8f}" for val in row)
-                f.write(f"  - [{row_str}]\n")
-
-
-        
-
-        self.get_logger().info(f"Extrinsic matrix saved to: {out_yaml}")
-
+        # dump inlier/outlier lists
+        idx = np.arange(len(pts2d))
+        inliers = idx[res_all <= np.median(res_all)+3*1.4826*np.median(np.abs(res_all-np.median(res_all)))]
+        outliers = np.setdiff1d(idx, inliers)
+        np.savetxt(os.path.join(plotdir,"inliers.txt"), inliers, fmt="%d")
+        np.savetxt(os.path.join(plotdir,"outliers.txt"), outliers, fmt="%d")
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CameraLidarExtrinsicNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
+    n = CalibrateExtrinsics()
+    rclpy.spin_once(n, timeout_sec=0.1)
+    n.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

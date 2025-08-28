@@ -1,179 +1,230 @@
 #!/usr/bin/env python3
-
 import os
 import cv2
-import open3d as o3d
 import numpy as np
-from rclpy.node import Node
+import open3d as o3d
 import rclpy
+from rclpy.node import Node
 
 from ros2_camera_lidar_fusion.common.read_yaml import extract_configuration
+from ros2_camera_lidar_fusion.common import utils
 
-class ImageCloudCorrespondenceNode(Node):
+PIX_EPS   = 8        # px radius for auto-pick
+SHORTLIST_K = 8      # how many nearest candidates to show
+WIN_NAME = "correspondences"
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+       
+class CorrespondenceTool(Node):
     def __init__(self):
-        super().__init__('image_cloud_correspondence_node')
+        super().__init__('correspondence_tool')
 
-        config_file = extract_configuration()
-        if config_file is None:
-            self.get_logger().error("Failed to extract configuration file.")
+        cfg = extract_configuration()
+        self.data_dir = cfg['general']['data_folder']
+        self.out_txt  = os.path.join(self.data_dir, cfg['general']['correspondence_file'])
+        intr_yaml     = os.path.join(cfg['general']['config_folder'],
+                                     cfg['general']['camera_intrinsic_calibration'])
+        self.K, self.D, (self.W, self.H) = utils.load_intrinsics(intr_yaml)
+
+        guess_yaml = os.path.join(cfg['general']['config_folder'],
+                                  cfg['general']['camera_extrinsic_calibration'])
+        self.T_guess = None
+        if os.path.isfile(guess_yaml):
+            try:
+                self.T_guess = utils.load_extrinsic(guess_yaml)
+                self.get_logger().info("Using existing extrinsic as guess for assisted 3D picking.")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to load extrinsic guess: {e}")
+
+        self.pairs = self._scan_pairs(self.data_dir)
+        if not self.pairs:
+            self.get_logger().error(f"No .png/.pcd pairs found in '{self.data_dir}'")
             return
-        
-        self.data_dir = config_file['general']['data_folder']
-        self.file = config_file['general']['correspondence_file']
 
-        if not os.path.exists(self.data_dir):
-            self.get_logger().warn(f"Data directory '{self.data_dir}' does not exist.")
-            os.makedirs(self.data_dir)
+        # State for mouse callback
+        self.click_queue = []          # list of (x,y) clicks
+        self.current_img = None
+        self.current_pcd = None
+        self.uv_guess    = None        # Nx2 projected points from guess
+        self.xyz_all     = None        # Nx3 original cloud points
 
-        self.get_logger().info(f"Looking for .png and .pcd file pairs in '{self.data_dir}'")
-        self.process_file_pairs()
+        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN_NAME, 1280, 720)
+        cv2.setMouseCallback(WIN_NAME, self._on_mouse)
 
-    def get_file_pairs(self, directory):
-        files = os.listdir(directory)
-        pairs_dict = {}
-        for f in files:
-            full_path = os.path.join(directory, f)
-            if not os.path.isfile(full_path):
-                continue
-            name, ext = os.path.splitext(f)
+        self.run()
 
-            if ext.lower() in [".png", ".jpg", ".jpeg", ".pcd"]:
-                if name not in pairs_dict:
-                    pairs_dict[name] = {}
-                if ext.lower() == ".png":
-                    pairs_dict[name]['png'] = full_path
-                elif ext.lower() == ".pcd":
-                    pairs_dict[name]['pcd'] = full_path
 
-        file_pairs = []
-        for prefix, d in pairs_dict.items():
-            if 'png' in d and 'pcd' in d:
-                file_pairs.append((prefix, d['png'], d['pcd']))
+    def _select_from_shortlist(self, base_img, click_uv):
+        """
+        Show top-K nearest projected points around click_uv on the image.
+        User chooses with keys '1'..'K'. 'm' = open Open3D instead, 'c' = cancel.
+        Returns 3D point (np.float32, shape(3,)) or None or the string 'open3d'.
+        """
+        if self.uv_guess is None or self.xyz_all is None:
+            return 'open3d'  # no guess: fall back to Open3D
 
-        file_pairs.sort()
-        return file_pairs
+        uv = self.uv_guess
+        d2 = np.sum((uv - np.float32(click_uv))[None, :]**2, axis=2).ravel() if uv.ndim==3 else np.sum((uv - np.float32(click_uv))**2, axis=1)
+        order = np.argsort(d2)[:min(SHORTLIST_K, len(d2))]
+        if order.size == 0:
+            return 'open3d'
 
-    def pick_image_points(self, image_path):
-        img = cv2.imread(image_path)
-        if img is None:
-            self.get_logger().error(f"Error loading image: {image_path}")
-            return []
+        vis = base_img.copy()
+        for i, idx in enumerate(order, start=1):
+            u, v = uv[idx]
+            cv2.circle(vis, (int(u), int(v)), 6, (0, 255, 255), 2)
+            cv2.putText(vis, str(i), (int(u)+8, int(v)-8), FONT, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(vis, str(i), (int(u)+8, int(v)-8), FONT, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-        points_2d = []
-        window_name = "Select points on the image (press 'q' or ESC to finish)"
-
-        def mouse_callback(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                points_2d.append((x, y))
-                self.get_logger().info(f"Image: click at ({x}, {y})")
-
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(window_name, mouse_callback)
+        cv2.putText(vis, "Pick 1..{}  |  m=Open3D  c=cancel".format(len(order)), (12, 32),
+                    FONT, 0.7, (40, 230, 40), 2, cv2.LINE_AA)
 
         while True:
-            display_img = img.copy()
-            for pt in points_2d:
-                cv2.circle(display_img, pt, 5, (0, 0, 255), -1)
+            cv2.imshow(WIN_NAME, vis)
+            k = cv2.waitKey(0) & 0xFF
+            if k in [ord(str(x)) for x in range(1, len(order)+1)]:
+                sel = int(chr(k)) - 1
+                return self.xyz_all[order[sel]].astype(np.float32)
+            if k == ord('m'):
+                return 'open3d'
+            if k == ord('c') or k == 27:
+                return None
 
-            cv2.imshow(window_name, display_img)
-            key = cv2.waitKey(10)
-            if key == 27 or key == ord('q'):
-                break
+    # ---------- IO helpers ----------
+    def _scan_pairs(self, d):
+        files = os.listdir(d); m = {}
+        for f in files:
+            n, e = os.path.splitext(f); p = os.path.join(d, f)
+            if e.lower() == '.png': m.setdefault(n, {})['png'] = p
+            if e.lower() == '.pcd': m.setdefault(n, {})['pcd'] = p
+        pairs = []
+        for k, v in sorted(m.items()):
+            if 'png' in v and 'pcd' in v:
+                pairs.append((k, v['png'], v['pcd']))
+        return pairs
 
-        cv2.destroyWindow(window_name)
-        return points_2d
+    # ---------- Mouse ----------
+    def _on_mouse(self, event, x, y, flags, param=None):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.click_queue.append((int(x), int(y)))
 
-    def pick_cloud_points(self, pcd_path):
-        pcd = o3d.io.read_point_cloud(pcd_path)
-        if pcd.is_empty():
-            self.get_logger().error(f"Empty or invalid point cloud: {pcd_path}")
-            return []
+    # ---------- Assisted picking ----------
+    def _prepare_guess_projection(self, pcd):
+        if self.T_guess is None: 
+            self.uv_guess = None; self.xyz_all = None; return
+        xyz = np.asarray(pcd.points, dtype=np.float32)
+        if xyz.shape[0] == 0:
+            self.uv_guess = None; self.xyz_all = None; return
+        pc = utils.transform_points(self.T_guess, xyz)
+        uv = utils.project_points(pc, self.K, self.D)
+        self.uv_guess = uv.astype(np.float32)
+        self.xyz_all  = xyz
 
-        self.get_logger().info("\n[Open3D Instructions]")
-        self.get_logger().info("  - Shift + left click to select a point")
-        self.get_logger().info("  - Use mouse drag + scroll for orbit/zoom")
-        self.get_logger().info("  - Press 'F' to focus on geometry")
-        self.get_logger().info("  - Press 'q' or ESC to close the window when finished\n")
+    def _autopick_3d(self, click_uv):
+        if self.uv_guess is None or self.xyz_all is None:
+            return None
+        cu = np.array(click_uv, dtype=np.float32)
+        d2 = np.sum((self.uv_guess - cu[None, :])**2, axis=1)
+        idx = np.argmin(d2)
+        if np.sqrt(d2[idx]) <= PIX_EPS:
+            return self.xyz_all[idx].astype(np.float32)
+        return None
 
+    def _manual_pick_3d(self, pcd):
         vis = o3d.visualization.VisualizerWithEditing()
-        vis.create_window(window_name="Select points on the cloud", width=1280, height=720)
+        vis.create_window(window_name="Pick one 3D point (Shift+LMB to add, Q to close)", width=1200, height=800)
         vis.add_geometry(pcd)
 
-        render_opt = vis.get_render_option()
-        render_opt.point_size = 3.5
-
-        # Camera setup: allow free orbit/zoom
-        ctr = vis.get_view_control()
-        ctr.set_zoom(0.8)      # start closer
-        ctr.set_front([0, 0, -1])
-        ctr.set_lookat(pcd.get_center())
-        ctr.set_up([0, -1, 0])
+        # a smaller point size helps the giant sphere look less overwhelming
+        ro = vis.get_render_option()
+        ro.point_size = 3
 
         vis.run()
+        inds = vis.get_picked_points()
         vis.destroy_window()
 
-        picked_indices = vis.get_picked_points()
-        np_points = np.asarray(pcd.points)
-        picked_xyz = []
-        for idx in picked_indices:
-            xyz = np_points[idx]
-            picked_xyz.append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
-            self.get_logger().info(f"Cloud: index={idx}, coords=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f})")
+        # IMPORTANT: re-register OpenCV window + callback after Open3D
+        cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN_NAME, 1280, 720)
+        cv2.setMouseCallback(WIN_NAME, self._on_mouse)
 
-        return picked_xyz
+        if not inds:
+            return None
+        p = np.asarray(pcd.points)[inds[0]].astype(np.float32)
+        return p
+
+    # ---------- Main loop ----------
+    def run(self):
+        for name, img_path, pcd_path in self.pairs:
+            img = cv2.imread(img_path)
+            pcd = o3d.io.read_point_cloud(pcd_path)
+            if img is None or pcd.is_empty():
+                self.get_logger().warn(f"Skip {name} (bad image/pcd).")
+                continue
+
+            self.current_img = img
+            self.current_pcd = pcd
+            self._prepare_guess_projection(pcd)
+
+            uv_list = []
+            xyz_list = []
+
+            overlay = img.copy()
+            msg = f"{name} | click=add, u=undo, s=save, q=quit"
+            cv2.putText(overlay, msg, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (40, 230, 40), 1, cv2.LINE_AA)
+
+            while True:
+                show = overlay.copy()
+                for (u, v) in uv_list:
+                    cv2.circle(show, (int(u), int(v)), 4, (0, 0, 255), -1)
+
+                cv2.imshow(WIN_NAME, show)
+                k = cv2.waitKey(10) & 0xFF
+
+                # handle pending clicks
+                while self.click_queue:
+                    (ux, vy) = self.click_queue.pop(0)
+
+                    # 1) try strict autopick
+                    p3 = self._autopick_3d((ux, vy))
+                    if p3 is None:
+                        # 2) shortlist UI on the image if guess exists
+                        choice = self._select_from_shortlist(self.current_img, (ux, vy))
+                        if isinstance(choice, str) and choice == 'open3d':
+                            # 3) real manual pick in 3D
+                            p3 = self._manual_pick_3d(self.current_pcd)
+                        else:
+                            p3 = choice
+
+                    if p3 is None:
+                        # user cancelled; continue without adding a pair
+                        continue
+
+                    uv_list.append((float(ux), float(vy)))
+                    xyz_list.append((float(p3[0]), float(p3[1]), float(p3[2])))
 
 
-    def process_file_pairs(self):
-        file_pairs = self.get_file_pairs(self.data_dir)
-        if not file_pairs:
-            self.get_logger().error(f"No .png / .pcd pairs found in '{self.data_dir}'")
-            return
+                if k == ord('u') and uv_list:
+                    uv_list.pop(); xyz_list.pop()
+                elif k == ord('s'):
+                    if len(uv_list) > 0:
+                        utils.write_corresp_append(self.out_txt, name, uv_list, xyz_list)
+                        self.get_logger().info(f"Saved {len(uv_list)} pairs for {name} → {self.out_txt}")
+                    else:
+                        self.get_logger().info(f"Find {len(uv_list)} pairs for {name}")
 
-        self.get_logger().info("Found the following pairs:")
-        for prefix, png_path, pcd_path in file_pairs:
-            self.get_logger().info(f"  {prefix} -> {png_path}, {pcd_path}")
+                    break
+                elif k == ord('q'):
+                    cv2.destroyWindow(WIN_NAME)
+                    return
 
-        for prefix, png_path, pcd_path in file_pairs:
-            self.get_logger().info("\n========================================")
-            self.get_logger().info(f"Processing pair: {prefix}")
-            self.get_logger().info(f"Image: {png_path}")
-            self.get_logger().info(f"Point Cloud: {pcd_path}")
-            self.get_logger().info("========================================\n")
-
-            image_points = self.pick_image_points(png_path)
-            self.get_logger().info(f"Selected {len(image_points)} points in the image.\n")
-
-            cloud_points = self.pick_cloud_points(pcd_path)
-            self.get_logger().info(f"Selected {len(cloud_points)} points in the cloud.\n")
-
-            out_txt = os.path.join(self.data_dir, self.file)
-            with open(out_txt, 'a') as f:   # append mode
-                f.write(f"# Pair: {prefix}\n")
-                f.write("# u, v, x, y, z\n")
-                min_len = min(len(image_points), len(cloud_points))
-                for i in range(min_len):
-                    (u, v) = image_points[i]
-                    (x, y, z) = cloud_points[i]
-                    f.write(f"{u},{v},{x},{y},{z}\n")
-                f.write("\n")  # blank line between pairs
-
-            self.get_logger().info(f"Saved {min_len} correspondences in: {out_txt}")
-            self.get_logger().info("========================================")
-
-        self.get_logger().info("\nProcessing complete! Correspondences saved for all pairs.")
-
+        cv2.destroyWindow(WIN_NAME)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ImageCloudCorrespondenceNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
+    node = CorrespondenceTool()
+    rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
