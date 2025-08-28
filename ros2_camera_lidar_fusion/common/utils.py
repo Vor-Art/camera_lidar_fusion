@@ -41,6 +41,13 @@ def transform_points(T, pts3d):
     qc = (ph @ T.T)[:,:3]
     return qc
 
+def invert_h(T):
+    R = T[:3,:3]; t = T[:3,3]
+    Ti = np.eye(4)
+    Ti[:3,:3] = R.T
+    Ti[:3,3]  = -R.T @ t
+    return Ti
+
 def project_points(pts_cam, K, D):
     rvec = np.zeros((3,1)); tvec = np.zeros((3,1))
     uv,_ = cv2.projectPoints(pts_cam.astype(np.float64), rvec, tvec, K, D)
@@ -228,3 +235,38 @@ def write_corresp_append(path, pair_name, uv, xyz):
         for (u,v),(X,Y,Z) in zip(uv,xyz):
             f.write(f"{u},{v},{X},{Y},{Z}\n")
         f.write("\n")
+
+# ---------- ROS helpers ----------
+def pointcloud2_to_xyz_array_fast(msg, skip_rate=1):
+    if getattr(msg, 'height', 0) == 0 or getattr(msg, 'width', 0) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    fields = [f.name for f in msg.fields]
+    if not all(k in fields for k in ('x','y','z')):
+        return np.zeros((0, 3), dtype=np.float32)
+    dtype = np.dtype([
+        ('x', np.float32), ('y', np.float32), ('z', np.float32),
+        ('_', f'V{msg.point_step - 12}')
+    ])
+    raw = np.frombuffer(msg.data, dtype=dtype)
+    pts = np.vstack((raw['x'], raw['y'], raw['z'])).T
+    return pts[::skip_rate] if skip_rate > 1 else pts
+
+def voxel_downsample_with_color(xyz_lidar, px, img_bgr, voxel_size):
+    if xyz_lidar.shape[0] == 0:
+        return np.zeros((0,3), np.float32), np.zeros((0,), np.float32)
+    bgr = img_bgr[px[:,1], px[:,0], :]
+    r = bgr[:,2].astype(np.float32); g = bgr[:,1].astype(np.float32); b = bgr[:,0].astype(np.float32)
+    vs = float(voxel_size)
+    keys = np.floor(xyz_lidar / vs).astype(np.int32)
+    key_view = keys.view([('ix', np.int32), ('iy', np.int32), ('iz', np.int32)]).reshape(-1)
+    _, inv = np.unique(key_view, return_inverse=True)
+    cnt = np.bincount(inv)
+    sx = np.bincount(inv, weights=xyz_lidar[:,0])
+    sy = np.bincount(inv, weights=xyz_lidar[:,1])
+    sz = np.bincount(inv, weights=xyz_lidar[:,2])
+    sr = np.bincount(inv, weights=r); sg = np.bincount(inv, weights=g); sb = np.bincount(inv, weights=b)
+    xyz_ds = np.stack((sx/cnt, sy/cnt, sz/cnt), axis=1).astype(np.float32)
+    r_avg = (sr/cnt).astype(np.uint32); g_avg = (sg/cnt).astype(np.uint32); b_avg = (sb/cnt).astype(np.uint32)
+    rgb_u32 = (r_avg << 16) | (g_avg << 8) | b_avg
+    rgb_f32 = rgb_u32.view(np.float32)
+    return xyz_ds, rgb_f32
