@@ -20,7 +20,6 @@ services:
     network_mode: host
     ipc: host
     pid: host
-    privileged: true
 
   rviz2:
     container_name: rviz2
@@ -43,7 +42,6 @@ services:
     network_mode: host
     ipc: host
     pid: host
-    privileged: true
     command: >
       bash -lc "source /opt/ros/humble/setup.bash &&
                 rviz2 -d /ros2_ws/src/ros2_camera_lidar_fusion/rviz_cfg/rviz_cfg.rviz"

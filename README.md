@@ -8,15 +8,7 @@ A ROS2 package for calculating **intrinsic** and **extrinsic calibration** betwe
 ## Visual Overview
 | **Static Sensors** | **Moving Sensors** |
 |---------------------|--------------------|
-| <img src="https://github.com/CDonosoK/ros2_camera_lidar_fusion/blob/main/assets/static_sensors.gif" alt="Static Sensors" width="400"> | <img src="https://github.com/CDonosoK/ros2_camera_lidar_fusion/blob/dev/assets/moving_sensors.gif" alt="Moving Sensors" width="400"> |
-
-## Support 💖
-
-If you find this project helpful and want to support its ongoing development, you can buy me a coffee! Every contribution helps me dedicate more time to improving and maintaining open-source software.
-
-<a href="https://www.buymeacoffee.com/CDonosoK" target="https://buymeacoffee.com/cdonosok">
-  <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support-orange?style=for-the-badge&logo=buy-me-a-coffee&logoColor=white" alt="Buy Me a Coffee">
-</a>
+| ![Static Sensors](assets/static_sensors.gif) width="400" | ![Moving Sensors](assets/moving_sensors.gif) width="400" |
 
 ---
 
@@ -41,31 +33,24 @@ To run this package, ensure the following dependencies are installed:
 - **Docker**: To streamline the environment setup and execution.
 - **NVIDIA Container Toolkit** (if using an NVIDIA GPU): For hardware acceleration.
 
-### Installation
-
-#### Clone the Repository
-Start by cloning the repository:
-```bash
-git clone git@github.com:CDonosoK/ros2_camera_lidar_fusion.git
-```
-
-#### Build Using Docker
+### Quick start using Docker
 This repository includes a pre-configured Docker setup for easy deployment. To build the Docker image:
-1. Navigate to the `docker` directory:
+1. Run the build script:
    ```bash
-   cd ros2_camera_lidar_fusion/docker
-   ```
-2. Run the build script:
-   ```bash
-   sh build.sh
+   docker compose build
    ```
    This will create a Docker image named `ros2_camera_lidar_fusion`.
 
-#### Run the Docker Container
-Once built, launch the container using:
-```bash
-sh run.sh
-```
+2. Once built, Launch the visuzlization:
+   ```bash
+   xhost +
+   docker compose up rviz2 -d 
+   ```
+
+3. Enter the :
+   ```bash
+   docker compose run --rm --remove-orphans ros2_camera_lidar_fusion
+   ```
 
 ---
 
@@ -76,7 +61,7 @@ This package includes the following ROS2 nodes for camera and LiDAR calibration:
 
 | **Node Name**           | **Description**                                                                                       | **Output**                                     |
 |--------------------------|-------------------------------------------------------------------------------------------------------|-----------------------------------------------|
-| `get_intrinsic_camera_calibration.py`  | Computes the intrinsic calibration of the camera.                                                    | Camera intrinsic calibration file.            |
+| `get_intrinsic_camera_calibration.py`  | Saves the intrinsic from camera_info to the file.                                                    | Camera intrinsic calibration file.            |
 | `save_sensor_data.py`    | Records synchronized data from camera and LiDAR sensors.                                             | Sensor data file.                             |
 | `extract_points.py`      | Allows manual selection of corresponding points between camera and LiDAR.                            | Corresponding points file.                    |
 | `get_extrinsic_camera_calibration.py` | Computes the extrinsic calibration between camera and LiDAR sensors.                                | Extrinsic calibration file.                   |
@@ -85,35 +70,38 @@ This package includes the following ROS2 nodes for camera and LiDAR calibration:
 ### Workflow
 Follow these steps to perform calibration and data fusion:
 
-1. **Intrinsic Calibration**  
-   Run `get_intrinsic_camera_calibration.py` to generate the intrinsic calibration file for the camera.
+1. **Extract Intrinsic to the file\***  
+   ```bash
+   ros2 run ros2_camera_lidar_fusion get_intrinsic_camera_calibration
+   ```
 
-2. **Data Recording**  
-   Use `save_sensor_data.py` to capture and save synchronized data from the camera and LiDAR.
+2. **Collect the data\***  
+   ```bash
+   ros2 run ros2_camera_lidar_fusion save_data # (press Enter to capture)
+   ```
 
-3. **Point Correspondence**  
-   Execute `extract_points.py` to manually select corresponding points between camera and LiDAR.
+3. **Label points pairs**  
+   ```bash
+   ros2 run ros2_camera_lidar_fusion extract_points
+   ```
 
 4. **Extrinsic Calibration**  
-   Run `get_extrinsic_camera_calibration.py` to compute the transformation matrix between camera and LiDAR.
+   ```bash
+   ros2 run ros2_camera_lidar_fusion get_extrinsic_camera_calibration
+   ```
 
 5. **LiDAR Projection**  
-   Use `lidar_camera_projection.py` to project LiDAR points into the camera frame for visualization and analysis.
-
-### Running Nodes
-To execute a specific node, use the following command:
-```bash
-ros2 run ros2_camera_lidar_fusion <node_name>
-```
-For example:
-```bash
-ros2 run ros2_camera_lidar_fusion lidar_camera_projection.py
-```
-
----
+   ```bash
+   ros2 run ros2_camera_lidar_fusion lidar_camera_projection
+   ```
+> \* you should run `ros2 bag play` in parallel
 
 ## Maintainer
 This package is maintained by:
+
+**Artem Voronov**  
+Email: [Artem.Voronov@skoltech.ru](mailto:Artem.Voronov@skoltech.ru)
+GitHub: [Vor-Art](https://github.com/Vor-Art)  
 
 **Clemente Donoso**  
 Email: [clemente.donosok@gmail.com](mailto:clemente.donosok@gmail.com)
