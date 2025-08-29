@@ -270,3 +270,41 @@ def voxel_downsample_with_color(xyz_lidar, px, img_bgr, voxel_size):
     rgb_u32 = (r_avg << 16) | (g_avg << 8) | b_avg
     rgb_f32 = rgb_u32.view(np.float32)
     return xyz_ds, rgb_f32
+
+
+def voxelize_numpy(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    return voxel_centroids_ravel_bincount(points, voxel_size)
+
+def voxel_centroids_sort_reduce(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    if points.size == 0: return points
+    vs = float(voxel_size)
+    grid = np.floor(points / vs).astype(np.int64)
+    order = np.lexsort((grid[:, 2], grid[:, 1], grid[:, 0]))
+    g = grid[order]
+    p = points[order].astype(np.float64)
+    change = np.any(np.diff(g, axis=0) != 0, axis=1)
+    idx = np.concatenate(([True], change)).nonzero()[0]
+    counts = np.diff(np.append(idx, g.shape[0]))
+    sums = np.add.reduceat(p, idx, axis=0)
+    return (sums / counts[:, None]).astype(np.float32)
+
+def voxel_centroids_ravel_bincount(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    if points.size == 0: return points
+    vs = float(voxel_size)
+    grid = np.floor(points / vs).astype(np.int64)
+    gmin = grid.min(axis=0)
+    grid -= gmin
+    span = grid.max(axis=0) + 1
+    cap = np.iinfo(np.int64).max
+    if int(span[0]) * int(span[1]) * int(span[2]) >= cap:
+        return voxel_centroids_sort_reduce(points, voxel_size)
+    lin = grid[:, 0] + span[0] * (grid[:, 1] + span[1] * grid[:, 2])
+    lin = lin.astype(np.int64)
+    uniq, inv, counts = np.unique(lin, return_inverse=True, return_counts=True)
+    x = np.bincount(inv, weights=points[:, 0].astype(np.float64), minlength=uniq.shape[0])
+    y = np.bincount(inv, weights=points[:, 1].astype(np.float64), minlength=uniq.shape[0])
+    z = np.bincount(inv, weights=points[:, 2].astype(np.float64), minlength=uniq.shape[0])
+    centers = np.stack((x, y, z), axis=1) / counts[:, None]
+    return centers.astype(np.float32)
+
+# ---------- New: bit-pack + sort + single reduc

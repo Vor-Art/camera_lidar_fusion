@@ -1,0 +1,1 @@
+docker compose run --rm --remove-orphans ros2_camera_lidar_fusion

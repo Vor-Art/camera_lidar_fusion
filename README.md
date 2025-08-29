@@ -49,7 +49,7 @@ This repository includes a pre-configured Docker setup for easy deployment. To b
 
 3. Enter the :
    ```bash
-   docker compose run --rm --remove-orphans ros2_camera_lidar_fusion
+    ./docker/run.sh
    ```
 
 ---
