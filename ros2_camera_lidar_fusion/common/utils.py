@@ -308,3 +308,112 @@ def voxel_centroids_ravel_bincount(points: np.ndarray, voxel_size: float) -> np.
     return centers.astype(np.float32)
 
 # ---------- New: bit-pack + sort + single reduc
+
+def voxel_downsample_with_color(xyz_lidar: np.ndarray,
+                                px: np.ndarray,
+                                img_bgr: np.ndarray,
+                                voxel_size: float):
+    # Empty guard
+    if xyz_lidar.shape[0] == 0 or px.shape[0] == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0,), np.float32)
+
+    # Keep arrays aligned (defensive)
+    n = min(xyz_lidar.shape[0], px.shape[0])
+    if n == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0,), np.float32)
+    xyz = np.ascontiguousarray(xyz_lidar[:n], dtype=np.float32)
+    u = np.ascontiguousarray(px[:n, 0], dtype=np.int64)
+    v = np.ascontiguousarray(px[:n, 1], dtype=np.int64)
+
+    # 1) Gather BGR with flat indexing (fewer fancy-index ops)
+    h, w = img_bgr.shape[:2]
+    lin_px = v * w + u
+    bgr = img_bgr.reshape(-1, 3)[lin_px]  # uint8
+    r = bgr[:, 2].astype(np.float64)  # sum in float64 for accuracy
+    g = bgr[:, 1].astype(np.float64)
+    b = bgr[:, 0].astype(np.float64)
+
+    # 2) Build integer grid & linear voxel keys (ravel+bincount path)
+    vs = float(voxel_size)
+    inv_vs = 1.0 / vs
+    grid = np.floor(xyz * inv_vs).astype(np.int64)  # int grid
+    gmin = grid.min(axis=0); grid -= gmin
+    span = grid.max(axis=0) + 1
+
+    # Overflow guard: if span product too large, fall back to sort+reduce
+    cap = np.iinfo(np.int64).max // 4
+    if int(span[0]) * int(span[1]) * int(span[2]) >= cap:
+        return _voxel_downsample_with_color_sort_reduce(xyz, r, g, b, voxel_size)
+
+    lin = grid[:, 0] + span[0] * (grid[:, 1] + span[1] * grid[:, 2])
+    # 3) Unique once → inv map and counts
+    uniq, inv, counts = np.unique(lin, return_inverse=True, return_counts=True)
+    m = uniq.shape[0]
+    denom = counts.astype(np.float64)
+
+    # 4) Accumulate xyz and colors with bincount (minlength=m ensures shape)
+    x_sum = np.bincount(inv, weights=xyz[:, 0].astype(np.float64), minlength=m)
+    y_sum = np.bincount(inv, weights=xyz[:, 1].astype(np.float64), minlength=m)
+    z_sum = np.bincount(inv, weights=xyz[:, 2].astype(np.float64), minlength=m)
+    r_sum = np.bincount(inv, weights=r, minlength=m)
+    g_sum = np.bincount(inv, weights=g, minlength=m)
+    b_sum = np.bincount(inv, weights=b, minlength=m)
+
+    xyz_ds = np.stack((x_sum/denom, y_sum/denom, z_sum/denom), axis=1).astype(np.float32)
+
+    # 5) Average BGR → pack to float32 RGB as in PCL convention
+    r_avg = np.rint(r_sum/denom).astype(np.uint32)
+    g_avg = np.rint(g_sum/denom).astype(np.uint32)
+    b_avg = np.rint(b_sum/denom).astype(np.uint32)
+    rgb_u32 = (r_avg << 16) | (g_avg << 8) | b_avg
+    rgb_f32 = rgb_u32.view(np.float32)
+    return xyz_ds, rgb_f32
+
+
+def _voxel_downsample_with_color_sort_reduce(xyz: np.ndarray,
+                                             r: np.ndarray, g: np.ndarray, b: np.ndarray,
+                                             voxel_size: float):
+    """Fallback when ravel space would overflow: bit-pack + sort + reduceat."""
+    if xyz.size == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0,), np.float32)
+    vs = float(voxel_size); inv_vs = 1.0 / vs
+    grid = np.floor(xyz * inv_vs).astype(np.int32)
+    grid -= grid.min(axis=0)
+
+    # 21-bit packing per axis: up to ~2 million voxels per axis
+    span = grid.max(axis=0) + 1
+    if np.any(span >= (1 << 21)):
+        # if even 21 bits per axis is too small, fall back to lexsort reduce
+        order = np.lexsort((grid[:, 2], grid[:, 1], grid[:, 0]))
+        key_sorted = grid[order]
+        packed = np.any(np.diff(key_sorted, axis=0) != 0, axis=1)
+        starts = np.concatenate(([True], packed))
+        idx = np.flatnonzero(starts)
+        counts = np.diff(np.append(idx, key_sorted.shape[0]))
+        P = np.c_[xyz[order].astype(np.float64),
+                  r[order], g[order], b[order]]
+        sums = np.add.reduceat(P, idx, axis=0)
+    else:
+        key = (grid[:, 0].astype(np.uint64) << 42) | \
+              (grid[:, 1].astype(np.uint64) << 21) | \
+               grid[:, 2].astype(np.uint64)
+        order = np.argsort(key)
+        key_s = key[order]
+        starts = np.empty(key_s.size, dtype=bool)
+        starts[0] = True
+        np.not_equal(key_s[1:], key_s[:-1], out=starts[1:])
+        idx = np.flatnonzero(starts)
+        counts = np.diff(np.append(idx, key_s.size))
+        P = np.c_[xyz[order].astype(np.float64),
+                  r[order], g[order], b[order]]
+        sums = np.add.reduceat(P, idx, axis=0)
+
+    denom = counts.astype(np.float64)[:, None]
+    means = (sums / denom)
+    xyz_ds = means[:, :3].astype(np.float32)
+    r_avg = np.rint(means[:, 3]).astype(np.uint32)
+    g_avg = np.rint(means[:, 4]).astype(np.uint32)
+    b_avg = np.rint(means[:, 5]).astype(np.uint32)
+    rgb_u32 = (r_avg << 16) | (g_avg << 8) | b_avg
+    rgb_f32 = rgb_u32.view(np.float32)
+    return xyz_ds, rgb_f32

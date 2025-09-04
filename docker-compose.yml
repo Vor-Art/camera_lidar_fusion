@@ -7,6 +7,7 @@ services:
     image: ros2_camera_lidar_fusion:latest
     stdin_open: true
     tty: true
+    env_file: ./docker/docker-compose.env
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
@@ -16,6 +17,8 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - .:/ros2_ws/src/ros2_camera_lidar_fusion
       - ../data:/data
+            # Fast DDS XML
+      - ./docker/rmw:/rmw:ro
     working_dir: /ros2_ws
     network_mode: host
     ipc: host
@@ -29,14 +32,23 @@ services:
     image: ros2_camera_lidar_fusion:latest
     stdin_open: true
     tty: true
+    env_file: ./docker/docker-compose.env
+    # GPU
+    runtime: nvidia
     environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-graphics,utility,compute}
+      # X11
       - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/root/.Xauthority
       - QT_X11_NO_MITSHM=1
-      - XAUTHORITY=/tmp/.docker.xauth
     volumes:
+      - ./docker/rmw:/rmw:ro # Fast DDS XML
       - $XAUTHORITY:/tmp/.docker.xauth
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro
       - .:/ros2_ws/src/ros2_camera_lidar_fusion
+      # data + configs
       - ../data:/data
     working_dir: /ros2_ws
     network_mode: host

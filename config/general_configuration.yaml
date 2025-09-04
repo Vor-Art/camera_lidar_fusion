@@ -10,14 +10,32 @@ output:
   flip_method: -1       # Flip debug image: -2=no, 0=vertical, 1=horizontal, -1=both
 
 densify_parameters:
-  # Tips:
-  #    grid_step_px ↓ (e.g., 2) → denser image-plane sampling; ↑ → sparser.
-  #    fill_iters 3–6 usually enough; more is slower.
-  #    voxel_size_m 0.05–0.10 for outdoors, 0.02–0.05 for indoors.""""
-  grid_step_px: 3          # uniform spacing on image plane
-  fill_iters: 16           # hole-fill iterations
-  voxel_size_m: 0.015       # voxel size in LiDAR frame (m)
-  max_interp_dist: 0.2     # do not interpolate points with hier distance (m)
+  voxel_size_m: 0.02
+  # Tips (Velodyne ring densify):
+  #   num_rings: 16 for VLP-16, 32/64 for other models.
+  #   az_bins ~ 400–800 for balance; more bins = finer azimuth grouping.
+  #   interp_per_gap sets max extra samples between rings (1–5 typical).
+  #   max_range_jump ~1.2–1.5 avoids bridging across rings with big difference in curvature.
+  #   max_gap_m ~0.2–0.5 keeps interpolation local; null disables the check.
+  velodyne_rings:
+    enable: True
+    num_rings: 16
+    az_bins: 3600
+    interp_per_gap: 12
+    max_range_jump: 1.31
+    max_gap_m: null         # use null if you want None in Python
+
+  # Tips (image-plane densify):
+  #   grid_step_px ↓ (e.g., 2) → denser sampling; ↑ → sparser, faster.
+  #   fill_iters   3–6 usually enough; higher = smoother but slower.
+  #   voxel_size_m ~0.05–0.10 for outdoors; ~0.02–0.05 for indoors.
+  #   max_interp_dist controls hole-fill aggressiveness; keep small (~0.2).
+  depth_uniform:
+    enable: True
+    grid_step_px: 1        # uniform spacing on image plane
+    fill_iters: 4         # hole-fill iterations
+    max_interp_dist: 0.2   # max distance (m) for interpolation
+
 
 general:
   config_folder: /ros2_ws/src/ros2_camera_lidar_fusion/config

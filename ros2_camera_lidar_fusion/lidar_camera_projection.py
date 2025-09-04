@@ -44,7 +44,8 @@ class LidarCameraProjectionNode(Node):
         projected_topic_pub = cfg['output']['projected_topic_pub']
         lidar_in_camera_pub = cfg['output']['lidar_in_camera_pub']
         self.pub_image = self.create_publisher(Image, projected_topic_pub, 1)
-        self.pub_cloud = self.create_publisher(PointCloud2, lidar_in_camera_pub, 1)
+        self.pub_cloud_color = self.create_publisher(PointCloud2, lidar_in_camera_pub, 1)
+        self.pub_cloud_orig = self.create_publisher(PointCloud2, "/lidar_orig", 1)
 
         self.bridge = CvBridge()
 
@@ -135,6 +136,7 @@ class LidarCameraProjectionNode(Node):
 
         # --- Publish cloud ---
         t0 = self.prof.t()
+        self.pub_cloud_orig.publish(lidar_msg)
         self.publish_colored_cloud(xyz_v, rgb_v, lidar_msg.header)
         self.prof.add("publish_cloud", self.prof.t() - t0)
 
@@ -162,7 +164,7 @@ class LidarCameraProjectionNode(Node):
         hdr.stamp = msg_header.stamp
         hdr.frame_id = msg_header.frame_id or "lidar"
         cloud_msg = pc2.create_cloud(hdr, fields, pts.tolist())
-        self.pub_cloud.publish(cloud_msg)
+        self.pub_cloud_color.publish(cloud_msg)
 
 
 def main(args=None):
