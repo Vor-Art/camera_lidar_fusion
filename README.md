@@ -10,6 +10,20 @@ A ROS2 package for calculating **intrinsic** and **extrinsic calibration** betwe
 |---------------------|--------------------|
 | ![Static Sensors](assets/static_sensors.gif) | ![Moving Sensors](assets/moving_sensors.gif) |
 
+| **Manual points correspondance** |
+|-----------------------------------------|
+| ![extract_points](assets/extract_points.gif) |
+> *use 'f' for to calcuclate prior extrinsics for hints*
+
+| **Camera Lidar prjection result** |
+|-----------------------------------------|
+| ![lidar_projection](assets/lidar_projection.gif) |
+
+**Calibration plots:**
+| **residual_box_final** | **residual_cdf_final** | **residual_hist_final** | **residual_box_final** |
+|---------------------|---|---|-----------------|
+| ![residual_box_final](assets/extrinsic_plots/residual_box_final.png) | ![residual_cdf_final](assets/extrinsic_plots/residual_cdf_final.png) | ![residual_hist_final](assets/extrinsic_plots/residual_hist_final.png) | ![residual_quiver](assets/extrinsic_plots/residual_quiver.png) |
+
 ---
 
 ## Table of Contents
